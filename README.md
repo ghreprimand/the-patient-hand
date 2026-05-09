@@ -1,34 +1,35 @@
 # The Patient Hand
 
-A visually-stunning take on the classic water-sort puzzle. Tap a tube, tap another, pour the top color, sort every tube to one color. Wrapped in a real-time fluid surface simulation, custom WebGL2 glass refraction shader, particle splashes, completion glow, and a warm 17th-century apothecary frame.
+A water-sort puzzle wrapped in hand-blown glass.
 
-The thesis: in a genre defined by spreadsheet-grade visuals, the prettiest version wins by default.
+The water-sort genre is proven — top-30 globally on mobile, hundreds of millions of installs — but every version ships the same flat colored rectangles inside cartoon outline tubes. *The Patient Hand* is the version that should have existed: the same satisfying loop, rendered with real-time fluid simulation, custom glass refraction shaders, and a warm 17th-century apothecary atmosphere.
 
-> **Status:** in early development. The full design and 14-day build plan live in [`docs/design.md`](./docs/design.md).
+Tap a tube, tap another, pour. Sort every tube to a single color. Liquids slosh, splash, and settle. Glass refracts the lamplit shelf behind it. Each liquid — cinnabar, lapis, verdigris, quicksilver — has its own subtle physical personality.
 
-## Quick links
+## Play
 
-- [Design doc & build plan](./docs/design.md)
-- [License (MIT)](./LICENSE)
+> **Status:** early development. Not yet deployed.
 
-## Repository conduct (read this before contributing)
+```bash
+git clone https://github.com/ghreprimand/the-patient-hand.git
+cd the-patient-hand
+npm install
+npm run dev
+```
 
-This repository is **public**. Treat it accordingly.
+Open `http://localhost:5173` in any browser with WebGL2 support.
 
-- **No secrets in the repo, ever.** No API keys, tokens, `.env` files, signing keys, deploy credentials, internal tooling output, or personal notes. The `.gitignore` enforces the obvious cases — `.env*`, `.archon/`, `.claude/`, `secrets/`, `credentials/`, etc. — but `.gitignore` is a backstop, not a strategy. **Run `git status` before every commit and read what you're staging.**
-- **If a secret is committed by accident, treat it as permanently disclosed.** Rotate the credential immediately. Do not "fix it later" with a force-push or rebase — assume it has already been scraped by the time you notice.
-- **No personal or unrelated material.** This repo is the game and only the game. Brainstorm scratch, design alternatives that didn't ship, agent transcripts, etc. live outside the repo and are excluded by `.gitignore`.
-- **Auto-commit cadence.** Work proceeds with frequent commits and pushes — at minimum once per completed checklist item in the build plan, and always at the end of a working session. Use descriptive commit messages (imperative mood, what + why). Push directly to `main`; no PR review at v1.
+## Tech
 
-## Tech stack (planned)
+- **Rendering:** Custom WebGL2 pipeline — no Three.js, no Pixi. Procedural GLSL shaders for the backdrop, glass tubes, liquid layers, pour stream, and splash particles. Everything is generated in the shader; no raster art assets.
+- **Simulation:** 1D height-field wave equation per tube for liquid surface dynamics. CPU particle system for splash droplets. Pour state machine with tilt, drain, and stream animation.
+- **Stack:** Vite + TypeScript. Zero runtime dependencies. HTML/CSS overlay for UI. Web Audio for sound.
+- **Bundle:** < 200KB gzipped total.
 
-- Vite + TypeScript
-- WebGL2, custom render wrapper (no Three.js / Pixi)
-- Web Audio API
-- HTML/CSS overlay UI
-- Cloudflare Workers + KV for the daily leaderboard backend
-- Zero runtime dependencies
+## Design
+
+The full design document — covering render pipeline, shader architecture, game rules, level taxonomy, audio design, and the 14-day build plan — lives at [`docs/design.md`](./docs/design.md).
 
 ## License
 
-Code under [MIT](./LICENSE). Art assets shipped with the repo are CC0 or CC-BY (specific attribution per asset, where applicable).
+Code: [MIT](./LICENSE). All visual output is procedurally generated (no external art assets to license).
