@@ -400,7 +400,9 @@ function handleTubeClick(app: AppState, idx: number): AppState {
     const amount = pourAmount(app.game, app.selected, idx);
     const srcX = app.centerXs[app.selected]!;
     const dstX = app.centerXs[idx]!;
-    const tiltSign = dstX >= srcX ? 1 : -1;
+    // Tube must tip *toward* dst.  See PourAnim.tiltSign docstring for
+    // why dst-on-the-right means a negative-signed tilt angle.
+    const tiltSign = dstX >= srcX ? -1 : 1;
     const visc = liquidVisual(liquid).viscosity;
     const pour = startPour({
       src: app.selected,

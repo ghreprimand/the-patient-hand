@@ -94,7 +94,7 @@ describe('pour state machine', () => {
     assert.ok(Math.abs(slow.drainDur / fast.drainDur - 4) < 1e-6);
   });
 
-  it('tilt sign matches direction', () => {
+  it('tilt sign multiplies pourTilt directly', () => {
     const r = startPour({
       src: 0, dst: 1, amount: 1, liquid: 'q', srcLayers: 1, dstLayers: 0,
       tiltSign: 1, viscosity: 1,

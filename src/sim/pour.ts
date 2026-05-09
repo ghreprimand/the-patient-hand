@@ -46,7 +46,13 @@ export interface PourAnim {
   /** Initial layer counts at pour start, captured for renderer math. */
   srcLayersAtStart: number;
   dstLayersAtStart: number;
-  /** +1 if dst is to the right of src, else -1.  Sign of the tilt angle. */
+  /**
+   * Sign multiplier on the tilt angle.  In our scene convention y is up
+   * and rotations are mathematically CCW-positive.  To physically pour
+   * toward dst on the right, the top of the tube must swing right
+   * (clockwise = negative angle).  So when dst is to the right of src,
+   * the caller passes tiltSign = -1; for dst to the left, +1.
+   */
   tiltSign: number;
 
   // Internal phase machinery
@@ -62,7 +68,7 @@ export interface PourParams {
   liquid: LiquidId;
   srcLayers: number;
   dstLayers: number;
-  /** +1 or -1 — sign of (dstX - srcX). */
+  /** Tilt-angle sign, see PourAnim.tiltSign for full semantics. */
   tiltSign: number;
   /** Viscosity multiplier from liquidVisual(liquid).viscosity. */
   viscosity: number;
