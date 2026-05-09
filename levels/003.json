@@ -1,0 +1,16 @@
+{
+  "id": "003",
+  "chapter": 1,
+  "name": "Quartet",
+  "capacity": 4,
+  "tubes": [
+    ["cinnabar", "lapis", "verdigris", "saffron"],
+    ["saffron", "verdigris", "lapis", "cinnabar"],
+    ["lapis", "saffron", "cinnabar", "verdigris"],
+    ["verdigris", "cinnabar", "saffron", "lapis"],
+    [],
+    []
+  ],
+  "optimalMoves": 11,
+  "author": "house"
+}

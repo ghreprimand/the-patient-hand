@@ -1,18 +1,28 @@
 /**
  * Scene shader — renders all tubes in one fullscreen pass on top of the
- * backdrop FBO.  Up to MAX_TUBES tubes per level.
+ * backdrop FBO.  Up to MAX_TUBES tubes per level, each with up to
+ * MAX_CAPACITY stacked liquid layers.
  *
  * Architecture:
  *   1. Find the closest tube SDF for this fragment.
  *   2. If we're outside any tube band, sample the backdrop directly.
- *   3. Otherwise apply the glass + liquid shading (refracts the backdrop).
+ *   3. Otherwise apply glass + per-layer liquid shading.
  *
- * This is the natural scaling of Day 2's single-tube shader.  Per-tube
- * quads remain a future optimization — for ≤16 tubes filling the screen,
- * the fullscreen pass is cheaper than batching draw calls.
+ * Layer stacking convention matches game/state.ts: tokens are stored
+ * bottom-up.  Layer 0 is the rounded base; layer N-1 is the top, the one
+ * pouring out next.  Layer y-extent in tube-local space:
+ *
+ *     layerH = 2.0 / capacity
+ *     layer i occupies y ∈ [-1 + i*layerH, -1 + (i+1)*layerH]
+ *
+ * The topmost layer's surface gets the bright meniscus highlight; layer
+ * boundaries between filled layers get a thin darker hairline so distinct
+ * colors read as discrete bands.  Bottom shadow band still applies to
+ * layer 0.  Day 7 wires per-tube wave heights into the meniscus.
  */
 
 export const MAX_TUBES = 16;
+export const MAX_CAPACITY = 8;
 
 export const SCENE_VERT = /* glsl */ `#version 300 es
 in vec2 a_pos;
@@ -29,26 +39,33 @@ precision highp float;
 in vec2 v_uv;
 out vec4 frag;
 
-#define MAX_TUBES ${MAX_TUBES}
+#define MAX_TUBES    ${MAX_TUBES}
+#define MAX_CAPACITY ${MAX_CAPACITY}
 
 uniform sampler2D u_backdrop;
 uniform float u_aspect;
 
-// Shared geometry — all tubes are the same size in v1.  Pour-tilt comes Day 5.
+// Shared geometry — all tubes are the same size in v1.
 uniform float u_tubeRadius;
 uniform float u_tubeHeight;
 uniform float u_wallThickness;
 
+// Shared logical capacity (how many layers a full tube has).
+uniform int   u_capacity;
+
 // Per-tube state.  u_tubeCount controls how many entries are valid.
 uniform int   u_tubeCount;
 uniform vec2  u_tubeCenter[MAX_TUBES];
-uniform float u_fillLevel[MAX_TUBES];
-uniform vec3  u_liquidColor[MAX_TUBES];
-uniform float u_liquidGlow[MAX_TUBES];
+uniform int   u_layerCount[MAX_TUBES];
+uniform float u_glow[MAX_TUBES];
+
+// Flat array of per-layer colors.  Layer i of tube t lives at index
+// (t * MAX_CAPACITY + i).  Unused slots are unread (any value is fine).
+uniform vec3  u_layerColor[MAX_TUBES * MAX_CAPACITY];
 
 // ----------------------------------------------------------------------------
 // SDF for one tube centered at \`center\`.  Same construction as Day 2:
-// rounded bottom, cylindrical body, flat top.
+// rounded bottom, cylindrical body, flat top (open mouth).
 // ----------------------------------------------------------------------------
 float tubeSDF(vec2 p, vec2 center) {
   p -= center;
@@ -59,7 +76,6 @@ float tubeSDF(vec2 p, vec2 center) {
   return d;
 }
 
-// Numerical normal of an SDF at point p with given center.
 vec2 tubeNormalAt(vec2 p, vec2 center) {
   vec2 e = vec2(0.001, 0.0);
   float dx = tubeSDF(p + e.xy, center) - tubeSDF(p - e.xy, center);
@@ -67,17 +83,22 @@ vec2 tubeNormalAt(vec2 p, vec2 center) {
   return normalize(vec2(dx, dy));
 }
 
+// Indexed array access that GLSL ES 3.0 allows when the index is a
+// constant expression in some places but not others.  WebGL2 supports
+// dynamic indexing of uniform arrays, so this is fine.
+vec3 layerColorAt(int tube, int layer) {
+  return u_layerColor[tube * MAX_CAPACITY + layer];
+}
+
 // ----------------------------------------------------------------------------
 // main
 // ----------------------------------------------------------------------------
 void main() {
-  // Aspect-correct centered space; same convention as Day 2.
   vec2 p = (v_uv * 2.0 - 1.0) * vec2(u_aspect, 1.0);
 
-  // Find nearest tube.  GLSL ES 3.0 allows constant-bounded for-loops with
-  // dynamic break, which is what we want here.
-  int nearestIdx = -1;
-  float nearestSdf = 1e9;
+  // Pick nearest tube.
+  int   nearestIdx    = -1;
+  float nearestSdf    = 1e9;
   vec2  nearestCenter = vec2(0.0);
   for (int i = 0; i < MAX_TUBES; i++) {
     if (i >= u_tubeCount) break;
@@ -100,14 +121,13 @@ void main() {
       vec2 N = tubeNormalAt(p, nearestCenter);
       vec2 Nuv = vec2(N.x / u_aspect, N.y) * 0.5;
 
-      vec3 liquidColor = u_liquidColor[nearestIdx];
-      float fillLevel  = u_fillLevel[nearestIdx];
-      float glow       = u_liquidGlow[nearestIdx];
+      int   layerCount = u_layerCount[nearestIdx];
+      float glow       = u_glow[nearestIdx];
 
       vec3 shaded;
 
       if (d > -u_wallThickness) {
-        // Glass band — refract the backdrop, add rim + spec.
+        // Glass band — refract the backdrop, add rim + spec + fill kiss.
         const float REFRACT = 0.55;
         vec2 refractUv = v_uv - Nuv * u_wallThickness * REFRACT;
         vec3 bg = texture(u_backdrop, refractUv).rgb;
@@ -129,36 +149,58 @@ void main() {
 
         shaded = bg + rim * rimColor * 0.75 + spec * specColor + fill * fillColor;
 
-        // AA the silhouette over the backdrop.
         float edgeAlpha = 1.0 - smoothstep(-aa, aa, d);
         shaded = mix(col, shaded, edgeAlpha);
       } else {
         // Tube interior.
-        float yLocal = (p.y - nearestCenter.y) / u_tubeHeight; // -1..+1
-        float fillTop = -1.0 + fillLevel * 2.0;
+        float yLocal  = (p.y - nearestCenter.y) / u_tubeHeight; // -1..+1
+        float layerH  = 2.0 / float(u_capacity);
+        float fillTop = -1.0 + float(layerCount) * layerH;
 
         float sideX = abs((p.x - nearestCenter.x) / u_tubeRadius);
         float curveShade = mix(1.0, 0.78, smoothstep(0.55, 1.0, sideX));
 
-        if (fillLevel > 0.0 && yLocal < fillTop) {
-          // Liquid.
+        if (layerCount > 0 && yLocal < fillTop) {
+          // Liquid: pick the layer this fragment belongs to.
+          int layerIdx = int(floor((yLocal + 1.0) / layerH));
+          // Clamp defensively: numerical wobble at fillTop could push
+          // layerIdx == layerCount.  We're below fillTop here, so the true
+          // index is layerCount-1 in that edge case.
+          layerIdx = clamp(layerIdx, 0, layerCount - 1);
+          vec3 liq = layerColorAt(nearestIdx, layerIdx);
+
+          // Depth shading from the surface (top of the topmost layer).
           float depthFromSurface = clamp(fillTop - yLocal, 0.0, 2.0);
-          vec3 liq = liquidColor;
-          liq *= (1.0 - depthFromSurface * 0.40);
+          liq *= (1.0 - depthFromSurface * 0.32);
 
-          // Glow boost (animated complete-state will multiply this later).
-          liq += liquidColor * glow * (1.0 - depthFromSurface * 0.5);
+          // Glow only on the topmost layer (subtle) — avoids the whole
+          // stack pulsing.  Day 13 will replace with a per-completion
+          // u_complete[i] uniform.
+          if (layerIdx == layerCount - 1) {
+            liq += layerColorAt(nearestIdx, layerIdx) * glow *
+                   (1.0 - depthFromSurface * 0.5);
+          }
 
+          // Meniscus on the topmost layer's surface.
           float meniscus = smoothstep(0.05, 0.0, abs(yLocal - fillTop));
           liq += vec3(1.0, 0.92, 0.72) * meniscus * (0.18 + 0.35 * glow);
 
+          // Hairline darkening at internal layer boundaries.  Skip the
+          // surface (top of topmost) and the floor (bottom of layer 0).
+          if (layerIdx > 0) {
+            float boundaryY = -1.0 + float(layerIdx) * layerH;
+            float hair = smoothstep(0.012, 0.0, abs(yLocal - boundaryY));
+            liq *= mix(1.0, 0.78, hair);
+          }
+
+          // Floor shadow at the rounded base.
           float bottomShade = smoothstep(-0.95, -1.05, yLocal);
           liq *= mix(1.0, 0.55, bottomShade);
 
           liq *= curveShade;
           shaded = liq;
         } else {
-          // Air pocket.
+          // Air pocket above the liquid.
           vec2 refractUv = v_uv - Nuv * 0.012;
           vec3 bg = texture(u_backdrop, refractUv).rgb;
           bg = mix(bg, bg * vec3(0.92, 0.96, 1.02), 0.30) * 0.88;
@@ -177,7 +219,7 @@ void main() {
     }
   }
 
-  // Filmic-ish tonemap to keep highlights from clipping.
+  // Filmic-ish tonemap.
   col = col / (col + vec3(0.55));
   col = pow(col, vec3(1.0 / 2.2));
   col = mix(col, col * vec3(1.04, 0.99, 0.92), 0.35);

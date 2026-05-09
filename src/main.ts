@@ -1,17 +1,19 @@
 /**
  * The Patient Hand — entry point.
  *
- * Day 3 scope: full apothecary scene.  Three-pass pipeline.
+ * Day 4: render is now driven by a pure `GameState` (game/state.ts).
+ * Pointer input selects a tube; a second click pours via game/rules.ts
+ * (snap-update — no animation yet, that's Day 5).  Three-pass GL
+ * pipeline unchanged from Day 3:
  *
- *   Pass 1 (FBO target):  apothecary backdrop — wall, leaded window,
- *                         walnut shelf, brass strip, oil lamp pool.
- *   Pass 2 (FBO target):  drop shadows under each tube (multiply blend).
- *   Pass 3 (canvas):      multi-tube scene shader; samples the FBO for
- *                         backdrop refraction, evaluates up to MAX_TUBES
- *                         glass+liquid SDFs.
+ *   Pass 1 (FBO):    apothecary backdrop (procedural).
+ *   Pass 2 (FBO):    drop shadows under each tube (multiply blend).
+ *   Pass 3 (canvas): scene shader — multi-tube layered liquid + glass,
+ *                    samples backdrop FBO for refraction.
  *
- * The 240Hz fixed-step accumulator is kept wired but unused; Day 5 fills
- * in the pour state machine.
+ * Selection feedback: the selected tube lifts (cy += LIFT_AMOUNT) and
+ * its glow uniform bumps.  Day 13 replaces the snap with an easing
+ * tween, but the lift channel is wired now so it composes cleanly.
  */
 
 import {
@@ -31,17 +33,56 @@ import {
   type Fbo,
 } from '@/render/fbo';
 import { BACKDROP_FRAG, BACKDROP_VERT, SHELF_Y } from '@/render/shaders/backdrop';
-import { MAX_TUBES, SCENE_FRAG, SCENE_VERT } from '@/render/shaders/scene';
+import {
+  MAX_CAPACITY,
+  MAX_TUBES,
+  SCENE_FRAG,
+  SCENE_VERT,
+} from '@/render/shaders/scene';
 import { SHADOW_FRAG, SHADOW_VERT } from '@/render/shaders/shadow';
 
-/** 240 Hz internal sim step, per design doc surface-sim spec. */
+import { applyPour, canPour } from '@/game/rules';
+import { type GameState, type LiquidId } from '@/game/state';
+import { loadLevel, type Level } from '@/game/level';
+import { liquidVisual } from '@/game/liquids';
+
+import level001 from '../levels/001.json';
+
+// ---------------------------------------------------------------------------
+// Tube layout
+// ---------------------------------------------------------------------------
+
+/** 240 Hz internal sim step. */
 const FIXED_STEP = 1 / 240;
 
-interface Frame {
-  t0: number;
-  prevMs: number;
-  acc: number;
+/** Shared tube geometry (tube-space units; aspect-corrected). */
+const TUBE_RADIUS = 0.115;
+const TUBE_HEIGHT = 0.42;
+const WALL_THICKNESS = 0.018;
+
+/** Tube-space y of the shelf top. */
+const SHELF_TOP_TS = SHELF_Y * 2 - 1; // ≈ -0.36
+const TUBE_BASE_CY = SHELF_TOP_TS + TUBE_HEIGHT - 0.01;
+
+/** Lift applied to the cy of the currently selected tube. */
+const LIFT_AMOUNT = 0.06;
+
+/** Glow boost on the selected tube's topmost layer. */
+const SELECTION_GLOW_BOOST = 0.18;
+
+/**
+ * Compute X centers for N tubes, evenly spaced and centered around x=0.
+ * Spacing scales with TUBE_RADIUS so layouts are visually consistent.
+ */
+function tubeCenterXs(n: number): number[] {
+  const spacing = TUBE_RADIUS * 2.7;
+  const start = -((n - 1) / 2) * spacing;
+  return Array.from({ length: n }, (_, i) => start + i * spacing);
 }
+
+// ---------------------------------------------------------------------------
+// GL pipeline scaffolding (mostly unchanged from Day 3)
+// ---------------------------------------------------------------------------
 
 interface ProgramRec {
   program: WebGLProgram;
@@ -57,73 +98,6 @@ interface Pipeline {
   scene: ProgramRec;
   fbo: Fbo;
 }
-
-/**
- * One tube's runtime state for rendering.  Day 4 will derive these from
- * the pure game state (`Tube` arrays of LiquidId).
- */
-interface TubeView {
-  /** Center in tube-space: x ∈ [-aspect, +aspect], y ∈ [-1, +1]. */
-  cx: number;
-  cy: number;
-  /** Fill ratio [0..1]. */
-  fill: number;
-  /** RGB in 0..1 per channel. */
-  color: [number, number, number];
-  /** Emissive bonus 0..1. */
-  glow: number;
-}
-
-// ---- Liquid palette (subset of the design doc's 12-liquid table) -----------
-// Day 11 promotes this to liquids.json.  Hex values come straight from the
-// design doc Liquid Personality Table.
-const LIQUID = {
-  cinnabar:    rgb('#c8312a'),
-  lapis:       rgb('#1c46a8'),
-  verdigris:   rgb('#3d8a6e'),
-  saffron:     rgb('#e0a02c'),
-  amethyst:    rgb('#7c3a8d'),
-  quicksilver: rgb('#9aa0a8'),
-} as const;
-
-function rgb(hex: string): [number, number, number] {
-  const v = parseInt(hex.slice(1), 16);
-  return [((v >> 16) & 0xff) / 255, ((v >> 8) & 0xff) / 255, (v & 0xff) / 255];
-}
-
-// Shared tube geometry.  All tubes the same size in v1.
-const TUBE_RADIUS = 0.115;
-const TUBE_HEIGHT = 0.42;
-const WALL_THICKNESS = 0.018;
-
-// Place six tubes on the shelf.  Tube-space y of the shelf top:
-//   v_uv y = SHELF_Y  →  tube-space y = SHELF_Y * 2 - 1 = -0.36
-// A tube whose center sits at (cx, -0.36 + TUBE_HEIGHT) has its rounded
-// base resting *on* the shelf horizon.  Slight bonus to embed the curve.
-const SHELF_TOP_TS = SHELF_Y * 2 - 1; // ≈ -0.36
-const TUBE_CY = SHELF_TOP_TS + TUBE_HEIGHT - 0.01;
-
-/**
- * Tube X centers in tube-space.  Spacing chosen so 6 tubes fit comfortably
- * at common aspect ratios (≥ 1.2).  Phone-portrait aspect (≈ 0.5) will
- * compress; layout responsiveness is a Day 8 concern.
- */
-const TUBE_SPACING = TUBE_RADIUS * 2.7;
-const TUBE_CXS = [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5].map((k) => k * TUBE_SPACING);
-
-/** Day 3 demo arrangement showing off the palette and varied fills. */
-const TUBES: TubeView[] = [
-  { cx: TUBE_CXS[0]!, cy: TUBE_CY, fill: 0.92, color: LIQUID.cinnabar,    glow: 0.18 },
-  { cx: TUBE_CXS[1]!, cy: TUBE_CY, fill: 0.55, color: LIQUID.lapis,       glow: 0.22 },
-  { cx: TUBE_CXS[2]!, cy: TUBE_CY, fill: 0.74, color: LIQUID.verdigris,   glow: 0.20 },
-  { cx: TUBE_CXS[3]!, cy: TUBE_CY, fill: 0.30, color: LIQUID.saffron,     glow: 0.30 },
-  { cx: TUBE_CXS[4]!, cy: TUBE_CY, fill: 0.00, color: LIQUID.quicksilver, glow: 0.00 }, // empty
-  { cx: TUBE_CXS[5]!, cy: TUBE_CY, fill: 0.62, color: LIQUID.amethyst,    glow: 0.24 },
-];
-
-// ----------------------------------------------------------------------------
-// Pipeline setup
-// ----------------------------------------------------------------------------
 
 function makeProgram(
   gl: WebGL2RenderingContext,
@@ -149,48 +123,98 @@ function setupPipeline(canvas: HTMLCanvasElement): Pipeline {
   const ctx = createContext(canvas);
   const { gl } = ctx;
   const buf = createStaticBuffer(gl, FULLSCREEN_TRI);
-
   const backdrop = makeProgram(gl, BACKDROP_VERT, BACKDROP_FRAG, 'backdrop', buf);
   const shadow = makeProgram(gl, SHADOW_VERT, SHADOW_FRAG, 'shadow', buf);
   const scene = makeProgram(gl, SCENE_VERT, SCENE_FRAG, 'scene', buf);
-
   const fbo = createFbo(gl, canvas.width, canvas.height);
-
   return { ctx, buf, backdrop, shadow, scene, fbo };
 }
 
-// ----------------------------------------------------------------------------
-// Per-pass uniform setters
-// ----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Scene state (mutable runtime data, kept distinct from pure GameState)
+// ---------------------------------------------------------------------------
 
-function packTubeArrays(): {
-  centers: Float32Array;
-  fills: Float32Array;
-  colors: Float32Array;
-  glows: Float32Array;
-  count: number;
-} {
-  const centers = new Float32Array(MAX_TUBES * 2);
-  const fills = new Float32Array(MAX_TUBES);
-  const colors = new Float32Array(MAX_TUBES * 3);
-  const glows = new Float32Array(MAX_TUBES);
-  for (let i = 0; i < TUBES.length; i++) {
-    const t = TUBES[i]!;
-    centers[i * 2] = t.cx;
-    centers[i * 2 + 1] = t.cy;
-    fills[i] = t.fill;
-    colors[i * 3] = t.color[0];
-    colors[i * 3 + 1] = t.color[1];
-    colors[i * 3 + 2] = t.color[2];
-    glows[i] = t.glow;
-  }
-  return { centers, fills, colors, glows, count: TUBES.length };
+interface AppState {
+  game: GameState;
+  /** Index of currently-selected tube, or null. */
+  selected: number | null;
+  /** X centers in tube-space; same length as game.tubes. */
+  centerXs: readonly number[];
 }
+
+function makeAppState(level: Level): AppState {
+  const game = loadLevel(level);
+  return {
+    game,
+    selected: null,
+    centerXs: tubeCenterXs(game.tubes.length),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame uniform packing
+// ---------------------------------------------------------------------------
+
+interface PackedTubes {
+  /** vec2 per slot, MAX_TUBES total. */
+  centers: Float32Array;
+  /** int per slot, MAX_TUBES total. */
+  layerCounts: Int32Array;
+  /** float per slot, MAX_TUBES total. */
+  glows: Float32Array;
+  /** vec3 per (tube, layer) — flat MAX_TUBES * MAX_CAPACITY. */
+  layerColors: Float32Array;
+  count: number;
+}
+
+function packTubeUniforms(app: AppState): PackedTubes {
+  const centers = new Float32Array(MAX_TUBES * 2);
+  const layerCounts = new Int32Array(MAX_TUBES);
+  const glows = new Float32Array(MAX_TUBES);
+  const layerColors = new Float32Array(MAX_TUBES * MAX_CAPACITY * 3);
+
+  const tubes = app.game.tubes;
+  for (let t = 0; t < tubes.length; t++) {
+    const tube = tubes[t]!;
+    const cx = app.centerXs[t]!;
+    let cy = TUBE_BASE_CY;
+    let glow = 0;
+
+    if (app.selected === t) {
+      cy += LIFT_AMOUNT;
+      glow += SELECTION_GLOW_BOOST;
+    }
+
+    centers[t * 2] = cx;
+    centers[t * 2 + 1] = cy;
+    layerCounts[t] = tube.tokens.length;
+
+    // Top-layer glow uses the per-liquid value; selection adds bonus.
+    const topId: LiquidId | null =
+      tube.tokens.length > 0 ? tube.tokens[tube.tokens.length - 1]! : null;
+    if (topId) glow += liquidVisual(topId).glow * 0.5;
+    glows[t] = glow;
+
+    for (let i = 0; i < tube.tokens.length; i++) {
+      const id = tube.tokens[i]!;
+      const c = liquidVisual(id).color;
+      const off = (t * MAX_CAPACITY + i) * 3;
+      layerColors[off] = c[0];
+      layerColors[off + 1] = c[1];
+      layerColors[off + 2] = c[2];
+    }
+  }
+
+  return { centers, layerCounts, glows, layerColors, count: tubes.length };
+}
+
+// ---------------------------------------------------------------------------
+// Pass execution
+// ---------------------------------------------------------------------------
 
 function drawBackdrop(pipe: Pipeline, timeS: number): void {
   const { gl } = pipe.ctx;
   const { backdrop } = pipe;
-
   bindFboTarget(gl, pipe.fbo);
   gl.disable(gl.BLEND);
   gl.useProgram(backdrop.program);
@@ -201,15 +225,12 @@ function drawBackdrop(pipe: Pipeline, timeS: number): void {
   gl.bindVertexArray(null);
 }
 
-function drawShadows(pipe: Pipeline, packed: ReturnType<typeof packTubeArrays>): void {
+function drawShadows(pipe: Pipeline, packed: PackedTubes): void {
   const { gl } = pipe.ctx;
   const { shadow } = pipe;
-
   bindFboTarget(gl, pipe.fbo);
-  // Multiply blend: dst = dst * src.
   gl.enable(gl.BLEND);
   gl.blendFunc(gl.DST_COLOR, gl.ZERO);
-
   gl.useProgram(shadow.program);
   gl.uniform1f(shadow.uniforms.loc('u_aspect'), pipe.ctx.width / pipe.ctx.height);
   gl.uniform1f(shadow.uniforms.loc('u_tubeRadius'), TUBE_RADIUS);
@@ -219,21 +240,17 @@ function drawShadows(pipe: Pipeline, packed: ReturnType<typeof packTubeArrays>):
   gl.bindVertexArray(shadow.vao);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
   gl.bindVertexArray(null);
-
   gl.disable(gl.BLEND);
 }
 
-function drawScene(pipe: Pipeline, packed: ReturnType<typeof packTubeArrays>): void {
+function drawScene(pipe: Pipeline, packed: PackedTubes, capacity: number): void {
   const { gl } = pipe.ctx;
   const { scene } = pipe;
-
   bindCanvasTarget(pipe.ctx);
   gl.clearColor(0, 0, 0, 1);
   gl.clear(gl.COLOR_BUFFER_BIT);
 
   gl.useProgram(scene.program);
-
-  // Backdrop FBO at texture unit 0.
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, pipe.fbo.texture);
   gl.uniform1i(scene.uniforms.loc('u_backdrop'), 0);
@@ -242,30 +259,96 @@ function drawScene(pipe: Pipeline, packed: ReturnType<typeof packTubeArrays>): v
   gl.uniform1f(scene.uniforms.loc('u_tubeRadius'), TUBE_RADIUS);
   gl.uniform1f(scene.uniforms.loc('u_tubeHeight'), TUBE_HEIGHT);
   gl.uniform1f(scene.uniforms.loc('u_wallThickness'), WALL_THICKNESS);
+  gl.uniform1i(scene.uniforms.loc('u_capacity'), capacity);
   gl.uniform1i(scene.uniforms.loc('u_tubeCount'), packed.count);
   gl.uniform2fv(scene.uniforms.loc('u_tubeCenter'), packed.centers);
-  gl.uniform1fv(scene.uniforms.loc('u_fillLevel'), packed.fills);
-  gl.uniform3fv(scene.uniforms.loc('u_liquidColor'), packed.colors);
-  gl.uniform1fv(scene.uniforms.loc('u_liquidGlow'), packed.glows);
+  gl.uniform1iv(scene.uniforms.loc('u_layerCount'), packed.layerCounts);
+  gl.uniform1fv(scene.uniforms.loc('u_glow'), packed.glows);
+  gl.uniform3fv(scene.uniforms.loc('u_layerColor'), packed.layerColors);
 
   gl.bindVertexArray(scene.vao);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
   gl.bindVertexArray(null);
 }
 
-// ----------------------------------------------------------------------------
-// Frame loop
-// ----------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Pointer input
+// ---------------------------------------------------------------------------
 
-function render(pipe: Pipeline, timeS: number): void {
+/**
+ * Convert a clientX/clientY pair to tube-space.  The mapping mirrors the
+ * scene shader: NDC = uv*2-1, multiplied by (aspect, 1).  y is flipped
+ * since DOM y grows downward.
+ */
+function clientToTubeSpace(
+  canvas: HTMLCanvasElement,
+  clientX: number,
+  clientY: number,
+): { x: number; y: number } {
+  const rect = canvas.getBoundingClientRect();
+  const u = (clientX - rect.left) / rect.width;
+  const v = 1 - (clientY - rect.top) / rect.height;
+  const aspect = rect.width / rect.height;
+  return { x: (u * 2 - 1) * aspect, y: v * 2 - 1 };
+}
+
+/**
+ * Tube hit test in tube-space.  Returns the tube index whose body
+ * contains the point, or -1.  (Inflated very slightly so finger-tap
+ * targets exceed glass silhouette by a touch — important for mobile.)
+ */
+function pickTube(app: AppState, p: { x: number; y: number }): number {
+  const TAP_INFLATE = 0.012;
+  for (let i = 0; i < app.game.tubes.length; i++) {
+    const cx = app.centerXs[i]!;
+    let cy = TUBE_BASE_CY;
+    if (app.selected === i) cy += LIFT_AMOUNT;
+    // Capsule with flat top, hemispherical bottom — same SDF as the shader.
+    const localX = p.x - cx;
+    const localY = p.y - cy;
+    const yClamped = Math.max(-TUBE_HEIGHT, Math.min(TUBE_HEIGHT, localY));
+    const dx = localX;
+    const dy = localY - yClamped;
+    const d = Math.hypot(dx, dy) - TUBE_RADIUS;
+    const dTop = localY - TUBE_HEIGHT;
+    const sdf = Math.max(d, dTop);
+    if (sdf < TAP_INFLATE) return i;
+  }
+  return -1;
+}
+
+function handleTubeClick(app: AppState, idx: number): AppState {
+  if (idx < 0) {
+    // Tap empty space → deselect.
+    return { ...app, selected: null };
+  }
+  if (app.selected === null) {
+    return { ...app, selected: idx };
+  }
+  if (app.selected === idx) {
+    return { ...app, selected: null };
+  }
+  // Two distinct tubes — try to pour.
+  if (canPour(app.game, app.selected, idx)) {
+    const next = applyPour(app.game, app.selected, idx);
+    return { ...app, game: next, selected: null };
+  }
+  // Illegal pour: move selection to the new tube.
+  return { ...app, selected: idx };
+}
+
+// ---------------------------------------------------------------------------
+// Frame loop
+// ---------------------------------------------------------------------------
+
+function render(pipe: Pipeline, app: AppState, timeS: number): void {
   const { gl, canvas } = pipe.ctx;
   resize(pipe.ctx);
   resizeFbo(gl, pipe.fbo, canvas.width, canvas.height);
-
-  const packed = packTubeArrays();
+  const packed = packTubeUniforms(app);
   drawBackdrop(pipe, timeS);
   drawShadows(pipe, packed);
-  drawScene(pipe, packed);
+  drawScene(pipe, packed, app.game.capacity);
 }
 
 function start(): void {
@@ -273,29 +356,44 @@ function start(): void {
   if (!canvas) throw new Error('Canvas #stage missing from DOM');
 
   const pipe = setupPipeline(canvas);
+  let app = makeAppState(level001 as Level);
 
-  const frame: Frame = { t0: performance.now(), prevMs: performance.now(), acc: 0 };
+  canvas.addEventListener('pointerdown', (e) => {
+    const p = clientToTubeSpace(canvas, e.clientX, e.clientY);
+    const idx = pickTube(app, p);
+    app = handleTubeClick(app, idx);
+  });
+
+  // Keyboard nudge — Day 14 polishes this; here as a freebie for testing.
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') app = { ...app, selected: null };
+    if (e.key === 'r' || e.key === 'R') {
+      app = makeAppState(level001 as Level);
+    }
+  });
+
+  const t0 = performance.now();
+  let prevMs = t0;
+  let acc = 0;
   void FIXED_STEP;
 
   function loop(nowMs: number): void {
-    const dt = Math.min(0.1, (nowMs - frame.prevMs) / 1000);
-    frame.prevMs = nowMs;
-
-    frame.acc += dt;
-    while (frame.acc >= FIXED_STEP) {
-      frame.acc -= FIXED_STEP;
-      // step(FIXED_STEP) — Day 5+ wires this.
+    const dt = Math.min(0.1, (nowMs - prevMs) / 1000);
+    prevMs = nowMs;
+    acc += dt;
+    while (acc >= FIXED_STEP) {
+      acc -= FIXED_STEP;
+      // Sim step — Day 5+ wires this.
     }
-
-    const timeS = (nowMs - frame.t0) / 1000;
-    render(pipe, timeS);
+    const timeS = (nowMs - t0) / 1000;
+    render(pipe, app, timeS);
     requestAnimationFrame(loop);
   }
 
   requestAnimationFrame(loop);
 
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) frame.prevMs = performance.now();
+    if (!document.hidden) prevMs = performance.now();
   });
 }
 

@@ -1,0 +1,15 @@
+{
+  "id": "002",
+  "chapter": 1,
+  "name": "Three Phials",
+  "capacity": 4,
+  "tubes": [
+    ["cinnabar", "lapis", "verdigris", "cinnabar"],
+    ["verdigris", "lapis", "cinnabar", "verdigris"],
+    ["lapis", "verdigris", "cinnabar", "lapis"],
+    [],
+    []
+  ],
+  "optimalMoves": 7,
+  "author": "house"
+}

@@ -1,0 +1,14 @@
+{
+  "id": "001",
+  "chapter": 1,
+  "name": "First Lesson",
+  "capacity": 4,
+  "tubes": [
+    ["cinnabar", "lapis", "cinnabar", "lapis"],
+    ["lapis", "cinnabar", "lapis", "cinnabar"],
+    [],
+    []
+  ],
+  "optimalMoves": 4,
+  "author": "house"
+}
