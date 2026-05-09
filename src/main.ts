@@ -1,18 +1,17 @@
 /**
  * The Patient Hand — entry point.
  *
- * Day 5: pour animation now drives between game-state snapshots.  When
- * the player chooses a (legal) pour, a PourAnim takes over: src tube
- * tilts up, drains layer-by-layer into dst, returns upright; then the
- * pure GameState commits via applyPour().  Input is locked while a
- * pour is in flight — only one pour at a time per the design doc.
+ * Day 7: height-field surface sim, splash impulse on pour impact, and
+ * CPU particle splash droplets rendered as GL POINTS.
  *
- * Pipeline (unchanged structurally):
+ * Pipeline:
  *   Pass 1 (FBO):    apothecary backdrop (procedural).
  *   Pass 2 (FBO):    drop shadows under each tube (multiply blend).
  *   Pass 3 (canvas): scene shader — multi-tube layered liquid + glass,
- *                    samples backdrop FBO for refraction.  Now reads
- *                    a per-tube tilt uniform.
+ *                    samples backdrop FBO for refraction.  Meniscus
+ *                    perturbed by the per-tube wave height field.
+ *   Pass 4 (canvas): pour stream — Bezier curve, premult-alpha blend.
+ *   Pass 5 (canvas): particles — GL POINTS, premult-alpha blend.
  */
 
 import {
@@ -37,9 +36,11 @@ import {
   MAX_TUBES,
   SCENE_FRAG,
   SCENE_VERT,
+  SURFACE_SAMPLES,
 } from '@/render/shaders/scene';
 import { SHADOW_FRAG, SHADOW_VERT } from '@/render/shaders/shadow';
 import { STREAM_FRAG, STREAM_VERT } from '@/render/shaders/stream';
+import { PARTICLE_FRAG, PARTICLE_VERT } from '@/render/shaders/particles';
 
 import { applyPour, canPour, pourAmount, topOf } from '@/game/rules';
 import { type GameState, type LiquidId } from '@/game/state';
@@ -56,6 +57,24 @@ import {
   startPour,
   stepPour,
 } from '@/sim/pour';
+
+import {
+  type SurfaceField,
+  clampSurfaceField,
+  createSurfaceField,
+  resetSurfaceField,
+  splashAt,
+  stepSurfaceField,
+} from '@/sim/surface';
+
+import {
+  type Particles,
+  MAX_PARTICLES,
+  createParticles,
+  clearParticles,
+  spawnSplash,
+  stepParticles,
+} from '@/sim/particles';
 
 import level001 from '../levels/001.json';
 
@@ -101,6 +120,17 @@ interface ProgramRec {
   vao: WebGLVertexArrayObject;
 }
 
+/** GL resources for the particle point-sprite pass. */
+interface ParticleGl {
+  program: WebGLProgram;
+  uniforms: UniformCache;
+  vao: WebGLVertexArrayObject;
+  /** Dynamic STREAM_DRAW buffer: 6 floats/particle (x y r g b alpha). */
+  buf: WebGLBuffer;
+  /** CPU-side staging array, reused each frame. */
+  staging: Float32Array;
+}
+
 interface Pipeline {
   ctx: GLContext;
   buf: WebGLBuffer;
@@ -108,6 +138,7 @@ interface Pipeline {
   shadow: ProgramRec;
   scene: ProgramRec;
   stream: ProgramRec;
+  particleGl: ParticleGl;
   fbo: Fbo;
 }
 
@@ -131,6 +162,44 @@ function makeProgram(
   return { program, uniforms, vao };
 }
 
+/** Build VAO + dynamic buffer for particle point-sprites. */
+function setupParticleGl(gl: WebGL2RenderingContext): ParticleGl {
+  const program = createProgram(gl, PARTICLE_VERT, PARTICLE_FRAG, 'particles');
+  const uniforms = new UniformCache(gl, program);
+
+  const vao = gl.createVertexArray();
+  if (!vao) throw new Error('Failed to allocate VAO (particles)');
+  const buf = gl.createBuffer();
+  if (!buf) throw new Error('Failed to allocate buffer (particles)');
+
+  // 6 floats per vertex: posX posY r g b alpha
+  const STRIDE = 6 * 4; // bytes
+  gl.bindVertexArray(vao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  // Pre-allocate for MAX_PARTICLES; data uploaded each frame.
+  gl.bufferData(gl.ARRAY_BUFFER, MAX_PARTICLES * STRIDE, gl.STREAM_DRAW);
+
+  // layout(location = 0) in vec2 a_pos
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, STRIDE, 0);
+  // layout(location = 1) in vec3 a_color
+  gl.enableVertexAttribArray(1);
+  gl.vertexAttribPointer(1, 3, gl.FLOAT, false, STRIDE, 2 * 4);
+  // layout(location = 2) in float a_alpha
+  gl.enableVertexAttribArray(2);
+  gl.vertexAttribPointer(2, 1, gl.FLOAT, false, STRIDE, 5 * 4);
+
+  gl.bindVertexArray(null);
+
+  return {
+    program,
+    uniforms,
+    vao,
+    buf,
+    staging: new Float32Array(MAX_PARTICLES * 6),
+  };
+}
+
 function setupPipeline(canvas: HTMLCanvasElement): Pipeline {
   const ctx = createContext(canvas);
   const { gl } = ctx;
@@ -139,8 +208,9 @@ function setupPipeline(canvas: HTMLCanvasElement): Pipeline {
   const shadow = makeProgram(gl, SHADOW_VERT, SHADOW_FRAG, 'shadow', buf);
   const scene = makeProgram(gl, SCENE_VERT, SCENE_FRAG, 'scene', buf);
   const stream = makeProgram(gl, STREAM_VERT, STREAM_FRAG, 'stream', buf);
+  const particleGl = setupParticleGl(gl);
   const fbo = createFbo(gl, canvas.width, canvas.height);
-  return { ctx, buf, backdrop, shadow, scene, stream, fbo };
+  return { ctx, buf, backdrop, shadow, scene, stream, particleGl, fbo };
 }
 
 // ---------------------------------------------------------------------------
@@ -155,6 +225,12 @@ interface AppState {
   centerXs: readonly number[];
   /** Active pour animation, or null when idle. */
   pour: PourAnim | null;
+  /** Per-tube wave height field for the meniscus. */
+  surface: SurfaceField;
+  /** CPU particle pool for splash droplets. */
+  particles: Particles;
+  /** Accumulator: frames since last splash spawn (throttle to ~30 Hz). */
+  splashSpawnAcc: number;
 }
 
 function makeAppState(level: Level): AppState {
@@ -164,6 +240,9 @@ function makeAppState(level: Level): AppState {
     selected: null,
     centerXs: tubeCenterXs(game.tubes.length),
     pour: null,
+    surface: createSurfaceField(game.tubes.length),
+    particles: createParticles(),
+    splashSpawnAcc: 0,
   };
 }
 
@@ -182,6 +261,8 @@ interface PackedTubes {
   tilts: Float32Array;
   /** vec3 per (tube, layer) — flat MAX_TUBES * MAX_CAPACITY. */
   layerColors: Float32Array;
+  /** float per (tube, sample) — flat MAX_TUBES * SURFACE_SAMPLES. */
+  surfaceHeights: Float32Array;
   count: number;
 }
 
@@ -191,6 +272,9 @@ function packTubeUniforms(app: AppState): PackedTubes {
   const glows = new Float32Array(MAX_TUBES);
   const tilts = new Float32Array(MAX_TUBES);
   const layerColors = new Float32Array(MAX_TUBES * MAX_CAPACITY * 3);
+  const surfaceHeights = new Float32Array(MAX_TUBES * SURFACE_SAMPLES);
+  // Copy current sim heights into the (potentially larger) uniform array.
+  surfaceHeights.set(app.surface.heights);
 
   const tubes = app.game.tubes;
   const pour = app.pour;
@@ -268,7 +352,15 @@ function packTubeUniforms(app: AppState): PackedTubes {
     glows[t] = glow;
   }
 
-  return { centers, layerCounts, glows, tilts, layerColors, count: tubes.length };
+  return {
+    centers,
+    layerCounts,
+    glows,
+    tilts,
+    layerColors,
+    surfaceHeights,
+    count: tubes.length,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +421,7 @@ function drawScene(pipe: Pipeline, packed: PackedTubes, capacity: number): void 
   gl.uniform1fv(scene.uniforms.loc('u_glow'), packed.glows);
   gl.uniform1fv(scene.uniforms.loc('u_tubeTilt'), packed.tilts);
   gl.uniform3fv(scene.uniforms.loc('u_layerColor'), packed.layerColors);
+  gl.uniform1fv(scene.uniforms.loc('u_surfaceHeights'), packed.surfaceHeights);
 
   gl.bindVertexArray(scene.vao);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -447,6 +540,73 @@ function drawStream(pipe: Pipeline, app: AppState, timeS: number): void {
 }
 
 // ---------------------------------------------------------------------------
+// Particle rendering
+// ---------------------------------------------------------------------------
+
+/** Pack alive particles into the staging buffer; return vertex count. */
+function packParticles(particles: Particles, staging: Float32Array): number {
+  const FIELDS = 6; // posX posY velX velY age ttl — in the sim's flat array
+  let count = 0;
+  for (let i = 0; i < MAX_PARTICLES; i++) {
+    const off = i * FIELDS;
+    const ttl = particles.data[off + 5] ?? 0;
+    if (ttl === 0) continue;
+    const age = particles.data[off + 4] ?? 0;
+    if (age >= ttl) continue;
+
+    const x = particles.data[off + 0] ?? 0;
+    const y = particles.data[off + 1] ?? 0;
+    const r = particles.colors[i * 3 + 0] ?? 0;
+    const g = particles.colors[i * 3 + 1] ?? 0;
+    const b = particles.colors[i * 3 + 2] ?? 0;
+
+    // Alpha: fade in quickly, fade out over last 40% of life.
+    const life = age / ttl;
+    const alpha = life < 0.1 ? life / 0.1 : 1.0 - Math.max(0, (life - 0.6) / 0.4);
+
+    const s = count * 6;
+    staging[s + 0] = x;
+    staging[s + 1] = y;
+    staging[s + 2] = r;
+    staging[s + 3] = g;
+    staging[s + 4] = b;
+    staging[s + 5] = Math.max(0, alpha);
+    count++;
+  }
+  return count;
+}
+
+function drawParticles(pipe: Pipeline, app: AppState): void {
+  if (app.particles.alive === 0) return;
+
+  const { gl } = pipe.ctx;
+  const pg = pipe.particleGl;
+
+  const count = packParticles(app.particles, pg.staging);
+  if (count === 0) return;
+
+  // Upload only the live portion of the staging buffer.
+  gl.bindBuffer(gl.ARRAY_BUFFER, pg.buf);
+  gl.bufferSubData(gl.ARRAY_BUFFER, 0, pg.staging.subarray(0, count * 6));
+
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+  gl.useProgram(pg.program);
+  gl.uniform1f(pg.uniforms.loc('u_aspect'), pipe.ctx.width / pipe.ctx.height);
+  // Point size in pixels — scale with canvas height so droplets are
+  // proportionally sized on all displays.  Clamped to a sensible range.
+  const pxSize = Math.max(3, Math.min(12, pipe.ctx.canvas.height * 0.012));
+  gl.uniform1f(pg.uniforms.loc('u_pointSize'), pxSize);
+
+  gl.bindVertexArray(pg.vao);
+  gl.drawArrays(gl.POINTS, 0, count);
+  gl.bindVertexArray(null);
+
+  gl.disable(gl.BLEND);
+}
+
+// ---------------------------------------------------------------------------
 // Pointer input
 // ---------------------------------------------------------------------------
 
@@ -548,6 +708,7 @@ function render(pipe: Pipeline, app: AppState, timeS: number): void {
   drawShadows(pipe, packed);
   drawScene(pipe, packed, app.game.capacity);
   drawStream(pipe, app, timeS);
+  drawParticles(pipe, app);
 }
 
 function start(): void {
@@ -569,7 +730,17 @@ function start(): void {
     if (e.key === 'r' || e.key === 'R') {
       app = makeAppState(level001 as Level);
     }
+    if (e.key === ' ') {
+      // Spacebar: nudge a small splash on every tube, for testing the
+      // surface sim independently of pours.
+      for (let t = 0; t < app.surface.tubeCount; t++) {
+        splashAt(app.surface, t, SURFACE_SAMPLES * 0.5, 0.3);
+      }
+    }
   });
+
+  void resetSurfaceField; // used in makeAppState path; suppress unused lint
+  void clearParticles;    // available for level-reset; suppress unused lint
 
   const t0 = performance.now();
   let prevMs = t0;
@@ -582,17 +753,54 @@ function start(): void {
     acc += dt;
     while (acc >= FIXED_STEP) {
       acc -= FIXED_STEP;
-      // Sim step.  Currently only the pour state machine; Day 7 adds
-      // the surface height field per tube.
+      // Sim step (240 Hz):
+      //   1. Pour state machine.
+      //   2. Surface wave field per tube.
+      //   3. Splash impulses + particle spawns on the dst tube during DRAIN.
+      //   4. Particle physics.
       if (app.pour) {
         const finished = stepPour(app.pour, FIXED_STEP);
+
+        // Splash impulse on the destination during drain phase.  Splash
+        // column maps the impact x to a surface sample index.  Power
+        // scales with how rapidly the level is rising (drain rate).
+        if (app.pour.phase === 'drain') {
+          const impactCol = (SURFACE_SAMPLES - 1) * 0.5; // dst is upright; impact at center
+          // Roughly one impulse per drain tick — modulate so we don't
+          // over-spike the field.  power magnitude tuned by smoke runs.
+          const power = 0.5 * FIXED_STEP * 60;
+          splashAt(app.surface, app.pour.dst, impactCol, power);
+
+          // Spawn splash particles at ~30 Hz (every 8th sim step).
+          app.splashSpawnAcc += FIXED_STEP;
+          const SPLASH_INTERVAL = 1 / 30;
+          if (app.splashSpawnAcc >= SPLASH_INTERVAL) {
+            app.splashSpawnAcc -= SPLASH_INTERVAL;
+            const dstCx = app.centerXs[app.pour.dst]!;
+            const dstLayers = pourDstLayers(app.pour);
+            const layerH = (2 * TUBE_HEIGHT) / app.game.capacity;
+            const impactY = TUBE_BASE_CY - TUBE_HEIGHT + dstLayers * layerH;
+            const visual = liquidVisual(app.pour.liquid);
+            // 2–4 particles per burst — small but visible.
+            const burstCount = 2 + Math.floor(Math.random() * 3);
+            spawnSplash(app.particles, dstCx, impactY, visual.color, burstCount);
+          }
+        }
+
         if (finished) {
-          // Commit the pour to the pure GameState now that the
-          // animation has finished.
+          // Commit the pour to the pure GameState; the visible layer
+          // counts of src/dst now match the actual GameState content.
           const next = applyPour(app.game, app.pour.src, app.pour.dst);
-          app = { ...app, game: next, pour: null };
+          app = { ...app, game: next, pour: null, splashSpawnAcc: 0 };
         }
       }
+
+      // Step surface waves.
+      stepSurfaceField(app.surface, FIXED_STEP);
+      clampSurfaceField(app.surface, 0.6);
+
+      // Step particles (gravity + aging).
+      stepParticles(app.particles, FIXED_STEP);
     }
     const timeS = (nowMs - t0) / 1000;
     render(pipe, app, timeS);

@@ -23,6 +23,8 @@
 
 export const MAX_TUBES = 16;
 export const MAX_CAPACITY = 8;
+/** Mirror of SURFACE_SAMPLES from sim/surface.ts. Keep in sync. */
+export const SURFACE_SAMPLES = 24;
 
 export const SCENE_VERT = /* glsl */ `#version 300 es
 in vec2 a_pos;
@@ -39,8 +41,9 @@ precision highp float;
 in vec2 v_uv;
 out vec4 frag;
 
-#define MAX_TUBES    ${MAX_TUBES}
-#define MAX_CAPACITY ${MAX_CAPACITY}
+#define MAX_TUBES        ${MAX_TUBES}
+#define MAX_CAPACITY     ${MAX_CAPACITY}
+#define SURFACE_SAMPLES  ${SURFACE_SAMPLES}
 
 uniform sampler2D u_backdrop;
 uniform float u_aspect;
@@ -65,6 +68,13 @@ uniform float u_tubeTilt[MAX_TUBES];
 // Flat array of per-layer colors.  Layer i of tube t lives at index
 // (t * MAX_CAPACITY + i).  Unused slots are unread (any value is fine).
 uniform vec3  u_layerColor[MAX_TUBES * MAX_CAPACITY];
+
+// Surface heights from sim/surface.ts.  Each tube has SURFACE_SAMPLES
+// samples in tube-local y units.  Day 7: meniscus perturbed by these.
+uniform float u_surfaceHeights[MAX_TUBES * SURFACE_SAMPLES];
+
+/** Tube-y scale applied to the unitless surface height field. */
+const float SURFACE_AMPLITUDE = 0.20;
 
 // ----------------------------------------------------------------------------
 // SDF for an upright tube centered at the origin.
@@ -121,6 +131,19 @@ vec2 tubeNormalAtTilted(vec2 p, vec2 center, float tilt) {
 // dynamic indexing of uniform arrays, so this is fine.
 vec3 layerColorAt(int tube, int layer) {
   return u_layerColor[tube * MAX_CAPACITY + layer];
+}
+
+// Linearly interpolate the surface height for a fragment at tube-local
+// xNorm ∈ [-1..+1].  Inside the meniscus we add this (scaled) to fillTop.
+float surfaceAt(int tube, float xNorm) {
+  float fcol = (xNorm * 0.5 + 0.5) * float(SURFACE_SAMPLES - 1);
+  fcol = clamp(fcol, 0.0, float(SURFACE_SAMPLES - 1));
+  int i0 = int(floor(fcol));
+  int i1 = min(i0 + 1, SURFACE_SAMPLES - 1);
+  float t = fcol - float(i0);
+  float h0 = u_surfaceHeights[tube * SURFACE_SAMPLES + i0];
+  float h1 = u_surfaceHeights[tube * SURFACE_SAMPLES + i1];
+  return mix(h0, h1, t) * SURFACE_AMPLITUDE;
 }
 
 // ----------------------------------------------------------------------------
@@ -190,27 +213,32 @@ void main() {
       } else {
         // Tube interior — work in tube-local frame so tilt rotates
         // the layer math along with the SDF.  Layers therefore stay
-        // parallel to the tube's body, which matches the "real-tube
-        // banded liquid" cheat we're using until Day 7's surface sim.
+        // parallel to the tube's body — a cheap visual cheat that
+        // reads fine at TILT_MAX = 18°.
         vec2 local = toTubeLocal(p, nearestCenter, nearestTilt);
         float yLocal  = local.y / u_tubeHeight; // -1..+1
         float layerH  = 2.0 / float(u_capacity);
         float fillTop = -1.0 + float(layerCount) * layerH;
 
-        float sideX = abs(local.x / u_tubeRadius);
+        // Sample the wavy surface from the height field; perturb fillTop
+        // only — internal layer boundaries stay flat.
+        float xNorm   = local.x / u_tubeRadius;
+        float surfH   = surfaceAt(nearestIdx, xNorm);
+        float fillTopWavy = fillTop + surfH;
+
+        float sideX = abs(xNorm);
         float curveShade = mix(1.0, 0.78, smoothstep(0.55, 1.0, sideX));
 
-        if (layerCount > 0 && yLocal < fillTop) {
-          // Liquid: pick the layer this fragment belongs to.
+        if (layerCount > 0 && yLocal < fillTopWavy) {
+          // Liquid: pick the layer this fragment belongs to.  Use the
+          // *flat* fillTop for layer indexing — the wavy crest above it
+          // is part of the topmost layer.
           int layerIdx = int(floor((yLocal + 1.0) / layerH));
-          // Clamp defensively: numerical wobble at fillTop could push
-          // layerIdx == layerCount.  We're below fillTop here, so the true
-          // index is layerCount-1 in that edge case.
           layerIdx = clamp(layerIdx, 0, layerCount - 1);
           vec3 liq = layerColorAt(nearestIdx, layerIdx);
 
-          // Depth shading from the surface (top of the topmost layer).
-          float depthFromSurface = clamp(fillTop - yLocal, 0.0, 2.0);
+          // Depth shading from the wavy surface.
+          float depthFromSurface = clamp(fillTopWavy - yLocal, 0.0, 2.0);
           liq *= (1.0 - depthFromSurface * 0.32);
 
           // Glow only on the topmost layer (subtle) — avoids the whole
@@ -221,8 +249,8 @@ void main() {
                    (1.0 - depthFromSurface * 0.5);
           }
 
-          // Meniscus on the topmost layer's surface.
-          float meniscus = smoothstep(0.05, 0.0, abs(yLocal - fillTop));
+          // Meniscus on the topmost layer's wavy surface.
+          float meniscus = smoothstep(0.05, 0.0, abs(yLocal - fillTopWavy));
           liq += vec3(1.0, 0.92, 0.72) * meniscus * (0.18 + 0.35 * glow);
 
           // Hairline darkening at internal layer boundaries.  Skip the
