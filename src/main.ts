@@ -1,17 +1,11 @@
 /**
  * The Patient Hand — entry point.
  *
- * Day 1 scope: bring up the WebGL2 context, run a fixed-step render loop
- * with an accumulator, and draw a placeholder warm-lamplight gradient so
- * we can prove the pipeline works end-to-end before the glass shader
- * arrives on Day 2.
- *
- * Strict separation per the design doc:
- *   game/  — pure logic, no rendering
- *   sim/   — visual physics (height field, particles, pour state machine)
- *   render/— GPU work
- *   audio/ — Web Audio mixer
- *   ui/    — HTML/CSS overlay
+ * Day 2 scope: replace the placeholder gradient with the glass-tube shader
+ * prototype.  A single fragment-shader-driven tube sits in the middle of
+ * the apothecary backdrop.  Refraction, rim, specular, liquid, meniscus —
+ * all evaluated per-fragment.  Days 3+ split this into a backdrop FBO +
+ * per-tube quads, but the shader logic carries over.
  */
 
 import {
@@ -23,7 +17,7 @@ import {
   UniformCache,
   type GLContext,
 } from '@/render/gl';
-import { SCAFFOLD_FRAG, SCAFFOLD_VERT } from '@/render/shaders/scaffold';
+import { GLASS_FRAG, GLASS_VERT } from '@/render/shaders/glass';
 
 interface Frame {
   /** Wall-clock ms at boot. */
@@ -41,13 +35,29 @@ interface Renderer {
   vao: WebGLVertexArrayObject;
 }
 
-const FIXED_STEP = 1 / 240; // 240 Hz internal sim, per design doc surface sim spec
+/** 240 Hz internal sim step, per design doc surface-sim spec. */
+const FIXED_STEP = 1 / 240;
+
+/**
+ * Day 2 fixed scene: a single tube, half-full of cinnabar, centered.
+ * Day 4 makes these per-tube data driven by game state.
+ */
+const SCENE = {
+  tubeCenter: [0, -0.05] as [number, number],
+  tubeRadius: 0.16,
+  tubeHeight: 0.55,
+  wallThickness: 0.018,
+  fillLevel: 0.62,
+  // Cinnabar from the design doc liquid table (#c8312a)
+  liquidColor: [0xc8 / 255, 0x31 / 255, 0x2a / 255] as [number, number, number],
+  liquidGlow: 0.22,
+};
 
 function setupRenderer(canvas: HTMLCanvasElement): Renderer {
   const ctx = createContext(canvas);
   const { gl } = ctx;
 
-  const program = createProgram(gl, SCAFFOLD_VERT, SCAFFOLD_FRAG, 'scaffold');
+  const program = createProgram(gl, GLASS_VERT, GLASS_FRAG, 'glass');
   const uniforms = new UniformCache(gl, program);
   const buf = createStaticBuffer(gl, FULLSCREEN_TRI);
 
@@ -67,12 +77,30 @@ function render(r: Renderer, timeS: number): void {
   const { gl, width, height } = r.ctx;
   resize(r.ctx);
 
-  gl.clearColor(0.0, 0.0, 0.0, 1.0);
+  gl.clearColor(0, 0, 0, 1);
   gl.clear(gl.COLOR_BUFFER_BIT);
 
   gl.useProgram(r.program);
+  const aspect = width / height;
+
   gl.uniform1f(r.uniforms.loc('u_time'), timeS);
-  gl.uniform2f(r.uniforms.loc('u_resolution'), width, height);
+  gl.uniform1f(r.uniforms.loc('u_aspect'), aspect);
+  gl.uniform2f(
+    r.uniforms.loc('u_tubeCenter'),
+    SCENE.tubeCenter[0],
+    SCENE.tubeCenter[1],
+  );
+  gl.uniform1f(r.uniforms.loc('u_tubeRadius'), SCENE.tubeRadius);
+  gl.uniform1f(r.uniforms.loc('u_tubeHeight'), SCENE.tubeHeight);
+  gl.uniform1f(r.uniforms.loc('u_wallThickness'), SCENE.wallThickness);
+  gl.uniform1f(r.uniforms.loc('u_fillLevel'), SCENE.fillLevel);
+  gl.uniform3f(
+    r.uniforms.loc('u_liquidColor'),
+    SCENE.liquidColor[0],
+    SCENE.liquidColor[1],
+    SCENE.liquidColor[2],
+  );
+  gl.uniform1f(r.uniforms.loc('u_liquidGlow'), SCENE.liquidGlow);
 
   gl.bindVertexArray(r.vao);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
@@ -86,19 +114,16 @@ function start(): void {
   const renderer = setupRenderer(canvas);
 
   const frame: Frame = { t0: performance.now(), prevMs: performance.now(), acc: 0 };
-
-  // Surface the sim step to future code without committing to a payload yet.
   void FIXED_STEP;
 
   function loop(nowMs: number): void {
-    const dt = Math.min(0.1, (nowMs - frame.prevMs) / 1000); // clamp to 100ms
+    const dt = Math.min(0.1, (nowMs - frame.prevMs) / 1000);
     frame.prevMs = nowMs;
 
-    // Day 1 has no sim; the accumulator is wired up so day 5 can step.
     frame.acc += dt;
     while (frame.acc >= FIXED_STEP) {
       frame.acc -= FIXED_STEP;
-      // step(FIXED_STEP)  — to be filled in on Day 5.
+      // step(FIXED_STEP) — Day 5 wires this up.
     }
 
     const timeS = (nowMs - frame.t0) / 1000;
@@ -108,15 +133,11 @@ function start(): void {
 
   requestAnimationFrame(loop);
 
-  // Pause-on-hide hook for the future. Today it just resets the prev timestamp
-  // so the next frame doesn't see a multi-second dt.
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) frame.prevMs = performance.now();
   });
 }
 
-// Surface bootstrap errors visibly. A blank black screen is the worst
-// possible failure mode; turn it into a parchment with the error text.
 try {
   start();
 } catch (err) {
