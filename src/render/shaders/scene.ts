@@ -58,17 +58,21 @@ uniform int   u_tubeCount;
 uniform vec2  u_tubeCenter[MAX_TUBES];
 uniform int   u_layerCount[MAX_TUBES];
 uniform float u_glow[MAX_TUBES];
+// Per-tube tilt in radians.  Rotation pivots around the tube's
+// hemispherical base so the tube tips like a real beaker.
+uniform float u_tubeTilt[MAX_TUBES];
 
 // Flat array of per-layer colors.  Layer i of tube t lives at index
 // (t * MAX_CAPACITY + i).  Unused slots are unread (any value is fine).
 uniform vec3  u_layerColor[MAX_TUBES * MAX_CAPACITY];
 
 // ----------------------------------------------------------------------------
-// SDF for one tube centered at \`center\`.  Same construction as Day 2:
-// rounded bottom, cylindrical body, flat top (open mouth).
+// SDF for an upright tube centered at the origin.
+//   - Hemispherical bottom at y = -h
+//   - Cylindrical body
+//   - Flat open top at y = +h
 // ----------------------------------------------------------------------------
-float tubeSDF(vec2 p, vec2 center) {
-  p -= center;
+float tubeSdfUpright(vec2 p) {
   float h = u_tubeHeight;
   float y = clamp(p.y, -h, h);
   float d = length(vec2(p.x, p.y - y)) - u_tubeRadius;
@@ -76,11 +80,40 @@ float tubeSDF(vec2 p, vec2 center) {
   return d;
 }
 
-vec2 tubeNormalAt(vec2 p, vec2 center) {
+// Map a world-space point into the tube's local frame.  The pivot of
+// rotation is the tube's hemispherical base; this matches the
+// physical mental model of a beaker tipping forward.
+//
+// Steps:
+//   1. Translate so pivot (center.x, center.y - h) is the origin.
+//   2. Rotate by -tilt to undo the tube's rotation.
+//   3. Translate so the tube's center maps back to (0, 0) — that is,
+//      shift up by h.
+vec2 toTubeLocal(vec2 p, vec2 center, float tilt) {
+  vec2 pivot = vec2(center.x, center.y - u_tubeHeight);
+  float ct = cos(tilt), st = sin(tilt);
+  // R(-tilt) in column-major mat2: columns (cos, -sin), (sin, cos).
+  mat2 R = mat2(ct, -st, st, ct);
+  vec2 q = R * (p - pivot);
+  return q - vec2(0.0, u_tubeHeight);
+}
+
+float tubeSdfTilted(vec2 p, vec2 center, float tilt) {
+  return tubeSdfUpright(toTubeLocal(p, center, tilt));
+}
+
+// Numerical normal in *local* (upright) frame; rotated back to world for
+// shading and refraction sampling.
+vec2 tubeNormalAtTilted(vec2 p, vec2 center, float tilt) {
+  vec2 local = toTubeLocal(p, center, tilt);
   vec2 e = vec2(0.001, 0.0);
-  float dx = tubeSDF(p + e.xy, center) - tubeSDF(p - e.xy, center);
-  float dy = tubeSDF(p + e.yx, center) - tubeSDF(p - e.yx, center);
-  return normalize(vec2(dx, dy));
+  float dx = tubeSdfUpright(local + e.xy) - tubeSdfUpright(local - e.xy);
+  float dy = tubeSdfUpright(local + e.yx) - tubeSdfUpright(local - e.yx);
+  vec2 N_local = normalize(vec2(dx, dy));
+  // Rotate normal back to world frame: R(+tilt) * N_local.
+  float ct = cos(tilt), st = sin(tilt);
+  mat2 Rfwd = mat2(ct, st, -st, ct);
+  return Rfwd * N_local;
 }
 
 // Indexed array access that GLSL ES 3.0 allows when the index is a
@@ -100,14 +133,17 @@ void main() {
   int   nearestIdx    = -1;
   float nearestSdf    = 1e9;
   vec2  nearestCenter = vec2(0.0);
+  float nearestTilt   = 0.0;
   for (int i = 0; i < MAX_TUBES; i++) {
     if (i >= u_tubeCount) break;
     vec2 c = u_tubeCenter[i];
-    float d = tubeSDF(p, c);
+    float t = u_tubeTilt[i];
+    float d = tubeSdfTilted(p, c, t);
     if (d < nearestSdf) {
       nearestSdf = d;
       nearestIdx = i;
       nearestCenter = c;
+      nearestTilt = t;
     }
   }
 
@@ -118,7 +154,7 @@ void main() {
     float aa = max(fwidth(d), 1e-5);
 
     if (d < aa) {
-      vec2 N = tubeNormalAt(p, nearestCenter);
+      vec2 N = tubeNormalAtTilted(p, nearestCenter, nearestTilt);
       vec2 Nuv = vec2(N.x / u_aspect, N.y) * 0.5;
 
       int   layerCount = u_layerCount[nearestIdx];
@@ -152,12 +188,16 @@ void main() {
         float edgeAlpha = 1.0 - smoothstep(-aa, aa, d);
         shaded = mix(col, shaded, edgeAlpha);
       } else {
-        // Tube interior.
-        float yLocal  = (p.y - nearestCenter.y) / u_tubeHeight; // -1..+1
+        // Tube interior — work in tube-local frame so tilt rotates
+        // the layer math along with the SDF.  Layers therefore stay
+        // parallel to the tube's body, which matches the "real-tube
+        // banded liquid" cheat we're using until Day 7's surface sim.
+        vec2 local = toTubeLocal(p, nearestCenter, nearestTilt);
+        float yLocal  = local.y / u_tubeHeight; // -1..+1
         float layerH  = 2.0 / float(u_capacity);
         float fillTop = -1.0 + float(layerCount) * layerH;
 
-        float sideX = abs((p.x - nearestCenter.x) / u_tubeRadius);
+        float sideX = abs(local.x / u_tubeRadius);
         float curveShade = mix(1.0, 0.78, smoothstep(0.55, 1.0, sideX));
 
         if (layerCount > 0 && yLocal < fillTop) {

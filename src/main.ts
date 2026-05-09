@@ -1,19 +1,18 @@
 /**
  * The Patient Hand — entry point.
  *
- * Day 4: render is now driven by a pure `GameState` (game/state.ts).
- * Pointer input selects a tube; a second click pours via game/rules.ts
- * (snap-update — no animation yet, that's Day 5).  Three-pass GL
- * pipeline unchanged from Day 3:
+ * Day 5: pour animation now drives between game-state snapshots.  When
+ * the player chooses a (legal) pour, a PourAnim takes over: src tube
+ * tilts up, drains layer-by-layer into dst, returns upright; then the
+ * pure GameState commits via applyPour().  Input is locked while a
+ * pour is in flight — only one pour at a time per the design doc.
  *
+ * Pipeline (unchanged structurally):
  *   Pass 1 (FBO):    apothecary backdrop (procedural).
  *   Pass 2 (FBO):    drop shadows under each tube (multiply blend).
  *   Pass 3 (canvas): scene shader — multi-tube layered liquid + glass,
- *                    samples backdrop FBO for refraction.
- *
- * Selection feedback: the selected tube lifts (cy += LIFT_AMOUNT) and
- * its glow uniform bumps.  Day 13 replaces the snap with an easing
- * tween, but the lift channel is wired now so it composes cleanly.
+ *                    samples backdrop FBO for refraction.  Now reads
+ *                    a per-tube tilt uniform.
  */
 
 import {
@@ -41,10 +40,20 @@ import {
 } from '@/render/shaders/scene';
 import { SHADOW_FRAG, SHADOW_VERT } from '@/render/shaders/shadow';
 
-import { applyPour, canPour } from '@/game/rules';
+import { applyPour, canPour, pourAmount, topOf } from '@/game/rules';
 import { type GameState, type LiquidId } from '@/game/state';
 import { loadLevel, type Level } from '@/game/level';
 import { liquidVisual } from '@/game/liquids';
+
+import {
+  type PourAnim,
+  pourDstLayers,
+  pourLiftSrc,
+  pourSrcLayers,
+  pourTilt,
+  startPour,
+  stepPour,
+} from '@/sim/pour';
 
 import level001 from '../levels/001.json';
 
@@ -140,6 +149,8 @@ interface AppState {
   selected: number | null;
   /** X centers in tube-space; same length as game.tubes. */
   centerXs: readonly number[];
+  /** Active pour animation, or null when idle. */
+  pour: PourAnim | null;
 }
 
 function makeAppState(level: Level): AppState {
@@ -148,6 +159,7 @@ function makeAppState(level: Level): AppState {
     game,
     selected: null,
     centerXs: tubeCenterXs(game.tubes.length),
+    pour: null,
   };
 }
 
@@ -162,6 +174,8 @@ interface PackedTubes {
   layerCounts: Int32Array;
   /** float per slot, MAX_TUBES total. */
   glows: Float32Array;
+  /** float per slot — radians, MAX_TUBES total. */
+  tilts: Float32Array;
   /** vec3 per (tube, layer) — flat MAX_TUBES * MAX_CAPACITY. */
   layerColors: Float32Array;
   count: number;
@@ -171,30 +185,52 @@ function packTubeUniforms(app: AppState): PackedTubes {
   const centers = new Float32Array(MAX_TUBES * 2);
   const layerCounts = new Int32Array(MAX_TUBES);
   const glows = new Float32Array(MAX_TUBES);
+  const tilts = new Float32Array(MAX_TUBES);
   const layerColors = new Float32Array(MAX_TUBES * MAX_CAPACITY * 3);
 
   const tubes = app.game.tubes;
+  const pour = app.pour;
+
+  // Pre-compute pour overrides if active.  Source loses layers from the
+  // top; dest gains them at the top.  The dest's *new* top is the
+  // pouring liquid (`pour.liquid`), so we override that color slot.
+  let pourSrcLayers_ = -1;
+  let pourDstLayers_ = -1;
+  if (pour) {
+    pourSrcLayers_ = pourSrcLayers(pour);
+    pourDstLayers_ = pourDstLayers(pour);
+  }
+
   for (let t = 0; t < tubes.length; t++) {
     const tube = tubes[t]!;
     const cx = app.centerXs[t]!;
     let cy = TUBE_BASE_CY;
     let glow = 0;
+    let tilt = 0;
+    let renderedLayerCount = tube.tokens.length;
 
-    if (app.selected === t) {
+    // Selection lift only applies when no pour is active.
+    if (!pour && app.selected === t) {
       cy += LIFT_AMOUNT;
       glow += SELECTION_GLOW_BOOST;
     }
 
+    if (pour && pour.src === t) {
+      cy += pourLiftSrc(pour);
+      tilt = pourTilt(pour);
+      renderedLayerCount = pourSrcLayers_;
+    } else if (pour && pour.dst === t) {
+      renderedLayerCount = pourDstLayers_;
+    }
+
     centers[t * 2] = cx;
     centers[t * 2 + 1] = cy;
-    layerCounts[t] = tube.tokens.length;
+    layerCounts[t] = renderedLayerCount;
+    tilts[t] = tilt;
 
-    // Top-layer glow uses the per-liquid value; selection adds bonus.
-    const topId: LiquidId | null =
-      tube.tokens.length > 0 ? tube.tokens[tube.tokens.length - 1]! : null;
-    if (topId) glow += liquidVisual(topId).glow * 0.5;
-    glows[t] = glow;
-
+    // Pack layer colors from the *current GameState*; for the dst tube
+    // during a pour we additionally fill the in-flight layers with the
+    // pouring color so the fill animation renders correctly.
     for (let i = 0; i < tube.tokens.length; i++) {
       const id = tube.tokens[i]!;
       const c = liquidVisual(id).color;
@@ -203,9 +239,32 @@ function packTubeUniforms(app: AppState): PackedTubes {
       layerColors[off + 1] = c[1];
       layerColors[off + 2] = c[2];
     }
+    if (pour && pour.dst === t) {
+      const c = liquidVisual(pour.liquid).color;
+      // Layers already in the dst from pre-pour state are at indices
+      // [0 .. pour.dstLayersAtStart-1].  In-flight tokens land at
+      // [dstLayersAtStart .. renderedLayerCount-1].
+      for (let i = pour.dstLayersAtStart; i < renderedLayerCount; i++) {
+        const off = (t * MAX_CAPACITY + i) * 3;
+        layerColors[off] = c[0];
+        layerColors[off + 1] = c[1];
+        layerColors[off + 2] = c[2];
+      }
+    }
+
+    // Top-layer glow.  Selection bonus already applied above.
+    const topRendered = renderedLayerCount > 0
+      ? (pour && pour.dst === t && renderedLayerCount > pour.dstLayersAtStart
+        ? pour.liquid
+        : (tube.tokens.length > 0 && renderedLayerCount > 0
+          ? tube.tokens[Math.min(renderedLayerCount, tube.tokens.length) - 1]!
+          : null))
+      : null;
+    if (topRendered) glow += liquidVisual(topRendered).glow * 0.5;
+    glows[t] = glow;
   }
 
-  return { centers, layerCounts, glows, layerColors, count: tubes.length };
+  return { centers, layerCounts, glows, tilts, layerColors, count: tubes.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +323,7 @@ function drawScene(pipe: Pipeline, packed: PackedTubes, capacity: number): void 
   gl.uniform2fv(scene.uniforms.loc('u_tubeCenter'), packed.centers);
   gl.uniform1iv(scene.uniforms.loc('u_layerCount'), packed.layerCounts);
   gl.uniform1fv(scene.uniforms.loc('u_glow'), packed.glows);
+  gl.uniform1fv(scene.uniforms.loc('u_tubeTilt'), packed.tilts);
   gl.uniform3fv(scene.uniforms.loc('u_layerColor'), packed.layerColors);
 
   gl.bindVertexArray(scene.vao);
@@ -318,20 +378,41 @@ function pickTube(app: AppState, p: { x: number; y: number }): number {
 }
 
 function handleTubeClick(app: AppState, idx: number): AppState {
+  // Lock input during an active pour.
+  if (app.pour) return app;
+
   if (idx < 0) {
-    // Tap empty space → deselect.
     return { ...app, selected: null };
   }
   if (app.selected === null) {
+    // Don't bother selecting an empty tube — there's nothing to pour.
+    if (app.game.tubes[idx]!.tokens.length === 0) return app;
     return { ...app, selected: idx };
   }
   if (app.selected === idx) {
     return { ...app, selected: null };
   }
-  // Two distinct tubes — try to pour.
+  // Two distinct tubes — try to start a pour animation.
   if (canPour(app.game, app.selected, idx)) {
-    const next = applyPour(app.game, app.selected, idx);
-    return { ...app, game: next, selected: null };
+    const src = app.game.tubes[app.selected]!;
+    const dst = app.game.tubes[idx]!;
+    const liquid = topOf(src)!;
+    const amount = pourAmount(app.game, app.selected, idx);
+    const srcX = app.centerXs[app.selected]!;
+    const dstX = app.centerXs[idx]!;
+    const tiltSign = dstX >= srcX ? 1 : -1;
+    const visc = liquidVisual(liquid).viscosity;
+    const pour = startPour({
+      src: app.selected,
+      dst: idx,
+      amount,
+      liquid,
+      srcLayers: src.tokens.length,
+      dstLayers: dst.tokens.length,
+      tiltSign,
+      viscosity: visc,
+    });
+    return { ...app, pour, selected: null };
   }
   // Illegal pour: move selection to the new tube.
   return { ...app, selected: idx };
@@ -383,7 +464,17 @@ function start(): void {
     acc += dt;
     while (acc >= FIXED_STEP) {
       acc -= FIXED_STEP;
-      // Sim step — Day 5+ wires this.
+      // Sim step.  Currently only the pour state machine; Day 7 adds
+      // the surface height field per tube.
+      if (app.pour) {
+        const finished = stepPour(app.pour, FIXED_STEP);
+        if (finished) {
+          // Commit the pour to the pure GameState now that the
+          // animation has finished.
+          const next = applyPour(app.game, app.pour.src, app.pour.dst);
+          app = { ...app, game: next, pour: null };
+        }
+      }
     }
     const timeS = (nowMs - t0) / 1000;
     render(pipe, app, timeS);
