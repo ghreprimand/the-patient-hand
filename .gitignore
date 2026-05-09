@@ -15,20 +15,6 @@ credentials/
 .cursor/
 .aider*
 
-# --- pre-project brainstorm scratch (kept locally, never published) ---
-/appideas.md
-/catalyst.md
-/claudepitches.md
-/codexpitches.md
-/codexpitches2.md
-/codexpitches3.md
-/creased-atlas.md
-/inverted-dungeon.md
-/lathe.md
-/pendulum-painter.md
-/pitches.md
-/shadow-shepherd.md
-
 # --- node / vite ---
 node_modules/
 dist/
