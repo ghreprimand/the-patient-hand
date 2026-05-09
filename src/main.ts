@@ -398,7 +398,7 @@ function drawShadows(pipe: Pipeline, packed: PackedTubes): void {
   gl.disable(gl.BLEND);
 }
 
-function drawScene(pipe: Pipeline, packed: PackedTubes, capacity: number): void {
+function drawScene(pipe: Pipeline, packed: PackedTubes, capacity: number, timeS: number): void {
   const { gl } = pipe.ctx;
   const { scene } = pipe;
   bindCanvasTarget(pipe.ctx);
@@ -411,6 +411,7 @@ function drawScene(pipe: Pipeline, packed: PackedTubes, capacity: number): void 
   gl.uniform1i(scene.uniforms.loc('u_backdrop'), 0);
 
   gl.uniform1f(scene.uniforms.loc('u_aspect'), pipe.ctx.width / pipe.ctx.height);
+  gl.uniform1f(scene.uniforms.loc('u_time'), timeS);
   gl.uniform1f(scene.uniforms.loc('u_tubeRadius'), TUBE_RADIUS);
   gl.uniform1f(scene.uniforms.loc('u_tubeHeight'), TUBE_HEIGHT);
   gl.uniform1f(scene.uniforms.loc('u_wallThickness'), WALL_THICKNESS);
@@ -706,7 +707,7 @@ function render(pipe: Pipeline, app: AppState, timeS: number): void {
   const packed = packTubeUniforms(app);
   drawBackdrop(pipe, timeS);
   drawShadows(pipe, packed);
-  drawScene(pipe, packed, app.game.capacity);
+  drawScene(pipe, packed, app.game.capacity, timeS);
   drawStream(pipe, app, timeS);
   drawParticles(pipe, app);
 }

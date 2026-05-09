@@ -38,12 +38,12 @@ function rgb(hex: string): [number, number, number] {
 }
 
 const TABLE: Readonly<Record<string, LiquidVisual>> = {
-  cinnabar:    { color: rgb('#c8312a'), glow: 0.20, viscosity: 0.85 },
-  lapis:       { color: rgb('#1c46a8'), glow: 0.22, viscosity: 1.00 },
-  verdigris:   { color: rgb('#3d8a6e'), glow: 0.18, viscosity: 1.00 },
-  saffron:     { color: rgb('#e0a02c'), glow: 0.30, viscosity: 1.30 },
-  amethyst:    { color: rgb('#7c3a8d'), glow: 0.24, viscosity: 1.05 },
-  quicksilver: { color: rgb('#9aa0a8'), glow: 0.10, viscosity: 0.55 },
+  cinnabar:    { color: rgb('#d4352c'), glow: 0.25, viscosity: 0.85 },
+  lapis:       { color: rgb('#2c50cc'), glow: 0.28, viscosity: 1.00 },
+  verdigris:   { color: rgb('#40b098'), glow: 0.22, viscosity: 1.00 },
+  saffron:     { color: rgb('#f0b828'), glow: 0.35, viscosity: 1.30 },
+  amethyst:    { color: rgb('#8c42b8'), glow: 0.28, viscosity: 1.05 },
+  quicksilver: { color: rgb('#b8bcc8'), glow: 0.15, viscosity: 0.55 },
 };
 
 const FALLBACK: LiquidVisual = { color: [0.5, 0.5, 0.5], glow: 0, viscosity: 1 };

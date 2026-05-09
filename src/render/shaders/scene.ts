@@ -47,6 +47,19 @@ out vec4 frag;
 
 uniform sampler2D u_backdrop;
 uniform float u_aspect;
+uniform float u_time;
+
+// Cheap value-noise for glass caustic sparkle.
+float vnoise(vec2 p) {
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = fract(sin(dot(i, vec2(127.1, 311.7))) * 43758.5453);
+  float b = fract(sin(dot(i + vec2(1.0, 0.0), vec2(127.1, 311.7))) * 43758.5453);
+  float c = fract(sin(dot(i + vec2(0.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+  float d = fract(sin(dot(i + vec2(1.0, 1.0), vec2(127.1, 311.7))) * 43758.5453);
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
 
 // Shared geometry — all tubes are the same size in v1.
 uniform float u_tubeRadius;
@@ -186,27 +199,47 @@ void main() {
       vec3 shaded;
 
       if (d > -u_wallThickness) {
-        // Glass band — refract the backdrop, add rim + spec + fill kiss.
-        const float REFRACT = 0.55;
+        // ============================================================
+        // GLASS BAND — Fresnel rim, refraction, dual specular, tint.
+        // ============================================================
+        const float REFRACT = 1.2;
         vec2 refractUv = v_uv - Nuv * u_wallThickness * REFRACT;
         vec3 bg = texture(u_backdrop, refractUv).rgb;
-        bg = mix(bg, bg * vec3(0.93, 0.96, 1.02), 0.25);
+        // Slight blue-green glass tint.
+        bg = mix(bg, bg * vec3(0.88, 0.95, 1.06), 0.35);
 
-        float rim = smoothstep(-u_wallThickness, 0.0, d);
-        rim = pow(rim, 1.6);
+        // Fresnel-like rim: glass edges are more opaque/reflective,
+        // center is more see-through.  Based on distance through the
+        // glass wall (d goes from 0 at outer edge to -wallThickness).
+        float wallT = clamp(-d / u_wallThickness, 0.0, 1.0); // 0=outer 1=inner
+        float fresnel = pow(1.0 - wallT, 2.5);  // bright at outer edge
 
+        // Key light specular — warm, from upper-left (oil lamp).
         vec2 L  = normalize(vec2(-0.55, 0.83));
         float ndotl = max(dot(N, L), 0.0);
-        float spec  = pow(ndotl, 28.0) * 0.95;
+        float spec  = pow(ndotl, 42.0) * 1.8;  // tighter, brighter hot spot
 
-        vec2 Lf = normalize(vec2(0.45, -0.4));
-        float fill = pow(max(dot(N, Lf), 0.0), 6.0) * 0.18;
+        // Fill light specular — cool, from window side.
+        vec2 Lf = normalize(vec2(0.50, -0.35));
+        float fill = pow(max(dot(N, Lf), 0.0), 16.0) * 0.30;
 
-        vec3 rimColor  = vec3(0.92, 0.82, 0.58);
-        vec3 specColor = vec3(1.00, 0.94, 0.82);
-        vec3 fillColor = vec3(0.40, 0.55, 0.78);
+        // Thin bright line at the outer rim of the glass (catches the light).
+        float outerRim = smoothstep(aa * 2.0, -aa, d);
 
-        shaded = bg + rim * rimColor * 0.75 + spec * specColor + fill * fillColor;
+        vec3 rimColor  = vec3(1.0, 0.90, 0.65);
+        vec3 specColor = vec3(1.0, 0.95, 0.82);
+        vec3 fillColor = vec3(0.50, 0.65, 0.90);
+
+        shaded = bg * (0.75 + 0.25 * wallT);  // center more transparent
+        shaded += rimColor  * fresnel * 0.65;
+        shaded += specColor * spec;
+        shaded += fillColor * fill;
+        shaded += rimColor  * outerRim * 0.50;
+
+        // Subtle caustic sparkle on the glass — animated micro-noise.
+        float sparkle = vnoise(v_uv * vec2(180.0, 220.0) + u_time * 0.3);
+        sparkle = smoothstep(0.82, 0.97, sparkle) * fresnel;
+        shaded += vec3(1.0, 0.95, 0.85) * sparkle * 0.25;
 
         float edgeAlpha = 1.0 - smoothstep(-aa, aa, d);
         shaded = mix(col, shaded, edgeAlpha);
@@ -230,54 +263,100 @@ void main() {
         float curveShade = mix(1.0, 0.78, smoothstep(0.55, 1.0, sideX));
 
         if (layerCount > 0 && yLocal < fillTopWavy) {
-          // Liquid: pick the layer this fragment belongs to.  Use the
-          // *flat* fillTop for layer indexing — the wavy crest above it
-          // is part of the topmost layer.
+          // ============================================================
+          // LIQUID — rich, translucent, jewel-tone rendering.
+          // ============================================================
           int layerIdx = int(floor((yLocal + 1.0) / layerH));
           layerIdx = clamp(layerIdx, 0, layerCount - 1);
           vec3 liq = layerColorAt(nearestIdx, layerIdx);
 
-          // Depth shading from the wavy surface.
+          // --- Depth attenuation ---
+          // Deeper liquid is darker, simulating absorption.  More
+          // aggressive than before to give real depth.
           float depthFromSurface = clamp(fillTopWavy - yLocal, 0.0, 2.0);
-          liq *= (1.0 - depthFromSurface * 0.32);
+          float depthDarken = 1.0 - depthFromSurface * 0.55;
+          liq *= depthDarken;
 
-          // Glow only on the topmost layer (subtle) — avoids the whole
-          // stack pulsing.  Day 13 will replace with a per-completion
-          // u_complete[i] uniform.
+          // --- Translucency / subsurface scattering fake ---
+          // Near the glass edges, light passes through less liquid,
+          // so the color is brighter (like looking through the thin
+          // edge of a colored glass).  Near center it's deeper/richer.
+          float edgeBright = smoothstep(0.5, 1.0, sideX) * 0.35;
+          liq *= (1.0 + edgeBright);
+
+          // --- Inner caustic at liquid-glass junction ---
+          // A bright warm line where liquid meets the glass wall.
+          float causticEdge = smoothstep(0.92, 1.0, sideX);
+          vec3 causticColor = liq * 1.8 + vec3(0.15, 0.12, 0.06);
+          liq = mix(liq, causticColor, causticEdge * 0.40);
+
+          // --- Top-layer glow ---
           if (layerIdx == layerCount - 1) {
+            // Subsurface glow near the surface — liquid seems to
+            // emit light from within.
+            float surfGlow = exp(-depthFromSurface * 3.0);
             liq += layerColorAt(nearestIdx, layerIdx) * glow *
-                   (1.0 - depthFromSurface * 0.5);
+                   surfGlow * 1.4;
           }
 
-          // Meniscus on the topmost layer's wavy surface.
-          float meniscus = smoothstep(0.05, 0.0, abs(yLocal - fillTopWavy));
-          liq += vec3(1.0, 0.92, 0.72) * meniscus * (0.18 + 0.35 * glow);
+          // --- Meniscus highlight ---
+          // Bright, prominent meniscus that curves up at the edges
+          // (where liquid meets glass wall).
+          float meniscusDist = abs(yLocal - fillTopWavy);
+          float meniscus = smoothstep(0.08, 0.0, meniscusDist);
+          // Meniscus curves up at edges (concave meniscus).
+          float edgeLift = smoothstep(0.5, 1.0, sideX) * 0.04;
+          float meniscusEdge = smoothstep(0.06, 0.0,
+                               abs(yLocal - (fillTopWavy + edgeLift)));
+          meniscus = max(meniscus, meniscusEdge);
+          // Warm highlight, boosted for visibility.
+          vec3 meniscusColor = vec3(1.0, 0.92, 0.72);
+          liq += meniscusColor * meniscus * (0.45 + 0.40 * glow);
 
-          // Hairline darkening at internal layer boundaries.  Skip the
-          // surface (top of topmost) and the floor (bottom of layer 0).
+          // --- Layer boundary hairlines ---
           if (layerIdx > 0) {
             float boundaryY = -1.0 + float(layerIdx) * layerH;
-            float hair = smoothstep(0.012, 0.0, abs(yLocal - boundaryY));
-            liq *= mix(1.0, 0.78, hair);
+            float hair = smoothstep(0.014, 0.0, abs(yLocal - boundaryY));
+            liq *= mix(1.0, 0.68, hair);
           }
 
-          // Floor shadow at the rounded base.
-          float bottomShade = smoothstep(-0.95, -1.05, yLocal);
-          liq *= mix(1.0, 0.55, bottomShade);
+          // --- Floor shadow at the rounded base ---
+          float bottomShade = smoothstep(-0.90, -1.08, yLocal);
+          liq *= mix(1.0, 0.40, bottomShade);
 
+          // --- Cylindrical shading (curvature) ---
           liq *= curveShade;
+
+          // --- Specular highlight on the liquid surface ---
+          // A small bright spot from the lamp reflecting on the
+          // liquid's surface, near the top.
+          if (layerIdx == layerCount - 1 && depthFromSurface < 0.15) {
+            float liqSpec = smoothstep(0.15, 0.0, depthFromSurface);
+            liqSpec *= smoothstep(0.4, 0.0, abs(sideX - 0.25));
+            liq += vec3(1.0, 0.90, 0.70) * liqSpec * 0.30;
+          }
+
           shaded = liq;
         } else {
-          // Air pocket above the liquid.
-          vec2 refractUv = v_uv - Nuv * 0.012;
+          // Air pocket above the liquid — subtly refracts backdrop.
+          vec2 refractUv = v_uv - Nuv * 0.018;
           vec3 bg = texture(u_backdrop, refractUv).rgb;
-          bg = mix(bg, bg * vec3(0.92, 0.96, 1.02), 0.30) * 0.88;
+          // Glass-interior tint — everything seen through the tube is
+          // slightly blue-shifted and dimmed.
+          bg = mix(bg, bg * vec3(0.88, 0.93, 1.05), 0.35) * 0.82;
           bg *= curveShade;
 
-          float innerRim = smoothstep(-u_wallThickness * 2.5,
+          // Inner wall reflection — subtle bright band near the inner
+          // glass surface (total internal reflection at grazing angles).
+          float innerRim = smoothstep(-u_wallThickness * 3.0,
                                       -u_wallThickness, d);
           innerRim = 1.0 - innerRim;
-          bg += vec3(0.55, 0.50, 0.38) * innerRim * 0.10;
+          bg += vec3(0.65, 0.58, 0.42) * innerRim * 0.18;
+
+          // Faint reflection of the lamp on the inside of the glass.
+          float innerSpec = pow(max(dot(N, normalize(vec2(-0.5, 0.8))), 0.0),
+                                20.0) * 0.12;
+          bg += vec3(1.0, 0.88, 0.60) * innerSpec;
 
           shaded = bg;
         }
@@ -287,10 +366,13 @@ void main() {
     }
   }
 
-  // Filmic-ish tonemap.
-  col = col / (col + vec3(0.55));
+  // Filmic tonemap — higher denominator preserves saturation of the
+  // jewel-tone liquids against the dark backdrop.  Warm amber grade
+  // reinforces the oil-lamp atmosphere.
+  col = col / (col + vec3(0.72));
   col = pow(col, vec3(1.0 / 2.2));
-  col = mix(col, col * vec3(1.04, 0.99, 0.92), 0.35);
+  // Warm amber color grade — consistent with candlelit apothecary.
+  col = mix(col, col * vec3(1.08, 0.98, 0.88), 0.40);
 
   frag = vec4(col, 1.0);
 }
