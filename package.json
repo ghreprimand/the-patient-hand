@@ -1,0 +1,20 @@
+{
+  "name": "the-patient-hand",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A visually-stunning take on the classic water-sort puzzle.",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --import=tsx \"src/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}
