@@ -186,3 +186,17 @@ export function pourSrcLayers(p: PourAnim): number {
 export function pourDstLayers(p: PourAnim): number {
   return p.dstLayersAtStart + pourDrained(p);
 }
+
+/**
+ * Stream visibility window — only during drain, with a small fade-in
+ * at the start and fade-out at the end so it doesn't pop.  Returns 0..1.
+ */
+export function pourStreamOpacity(p: PourAnim): number {
+  if (p.phase !== 'drain') return 0;
+  const FADE = 0.06; // seconds
+  if (p.tInPhase < FADE) return p.tInPhase / FADE;
+  if (p.tInPhase > p.drainDur - FADE) {
+    return Math.max(0, (p.drainDur - p.tInPhase) / FADE);
+  }
+  return 1;
+}

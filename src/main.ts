@@ -39,6 +39,7 @@ import {
   SCENE_VERT,
 } from '@/render/shaders/scene';
 import { SHADOW_FRAG, SHADOW_VERT } from '@/render/shaders/shadow';
+import { STREAM_FRAG, STREAM_VERT } from '@/render/shaders/stream';
 
 import { applyPour, canPour, pourAmount, topOf } from '@/game/rules';
 import { type GameState, type LiquidId } from '@/game/state';
@@ -50,6 +51,7 @@ import {
   pourDstLayers,
   pourLiftSrc,
   pourSrcLayers,
+  pourStreamOpacity,
   pourTilt,
   startPour,
   stepPour,
@@ -105,6 +107,7 @@ interface Pipeline {
   backdrop: ProgramRec;
   shadow: ProgramRec;
   scene: ProgramRec;
+  stream: ProgramRec;
   fbo: Fbo;
 }
 
@@ -135,8 +138,9 @@ function setupPipeline(canvas: HTMLCanvasElement): Pipeline {
   const backdrop = makeProgram(gl, BACKDROP_VERT, BACKDROP_FRAG, 'backdrop', buf);
   const shadow = makeProgram(gl, SHADOW_VERT, SHADOW_FRAG, 'shadow', buf);
   const scene = makeProgram(gl, SCENE_VERT, SCENE_FRAG, 'scene', buf);
+  const stream = makeProgram(gl, STREAM_VERT, STREAM_FRAG, 'stream', buf);
   const fbo = createFbo(gl, canvas.width, canvas.height);
-  return { ctx, buf, backdrop, shadow, scene, fbo };
+  return { ctx, buf, backdrop, shadow, scene, stream, fbo };
 }
 
 // ---------------------------------------------------------------------------
@@ -332,6 +336,117 @@ function drawScene(pipe: Pipeline, packed: PackedTubes, capacity: number): void 
 }
 
 // ---------------------------------------------------------------------------
+// Stream rendering
+// ---------------------------------------------------------------------------
+
+/**
+ * Inverse of the shader's toTubeLocal: given a point expressed in the
+ * tube's upright local frame (origin at center, y up), return its
+ * world position taking the tube's tilt + base-pivot rotation.
+ */
+function localToWorld(
+  local: { x: number; y: number },
+  centerX: number,
+  centerY: number,
+  tilt: number,
+): { x: number; y: number } {
+  const c = Math.cos(tilt);
+  const s = Math.sin(tilt);
+  // Pivot is (centerX, centerY - TUBE_HEIGHT).  Local point in the
+  // pivot-relative frame is local + (0, +TUBE_HEIGHT).
+  const lx = local.x;
+  const ly = local.y + TUBE_HEIGHT;
+  // R(+tilt): (cx*x - s*y, s*x + c*y).
+  const wx = c * lx - s * ly;
+  const wy = s * lx + c * ly;
+  return { x: centerX + wx, y: centerY - TUBE_HEIGHT + wy };
+}
+
+interface StreamPoints {
+  /** Source lip in world (tube-space). */
+  p0x: number;
+  p0y: number;
+  /** Bezier control point. */
+  p1x: number;
+  p1y: number;
+  /** Dst impact in world (tube-space). */
+  p2x: number;
+  p2y: number;
+}
+
+/** Compute Bezier control points for the active pour stream. */
+function streamPoints(app: AppState, pour: PourAnim, timeS: number): StreamPoints {
+  const srcCx = app.centerXs[pour.src]!;
+  const dstCx = app.centerXs[pour.dst]!;
+  const tilt = pourTilt(pour);
+  const lift = pourLiftSrc(pour);
+  // Source lip is on the side of the tube facing dst.  In upright local
+  // frame, that's at x = -tiltSign * TUBE_RADIUS (see PourAnim.tiltSign).
+  const lipLocal = { x: -pour.tiltSign * TUBE_RADIUS, y: TUBE_HEIGHT };
+  const lipWorld = localToWorld(lipLocal, srcCx, TUBE_BASE_CY + lift, tilt);
+
+  // Impact: top of dst's current liquid level.  Dst stays upright.
+  const dstLayers = pourDstLayers(pour);
+  const layerH = (2 * TUBE_HEIGHT) / app.game.capacity;
+  const impactY = TUBE_BASE_CY - TUBE_HEIGHT + dstLayers * layerH;
+  const impactX = dstCx;
+
+  // Control point: midway between p0 and p2, lifted slightly above
+  // the higher of the two endpoints, plus a small time-varying wobble.
+  const midX = (lipWorld.x + impactX) * 0.5;
+  const midY = Math.max(lipWorld.y, impactY) + 0.07;
+  const wobble = 0.012 * Math.sin(timeS * 6.5);
+  return {
+    p0x: lipWorld.x,
+    p0y: lipWorld.y,
+    p1x: midX + wobble,
+    p1y: midY,
+    p2x: impactX,
+    p2y: impactY,
+  };
+}
+
+function drawStream(pipe: Pipeline, app: AppState, timeS: number): void {
+  const pour = app.pour;
+  if (!pour) return;
+  const opacity = pourStreamOpacity(pour);
+  if (opacity <= 0) return;
+
+  const { gl } = pipe.ctx;
+  const { stream } = pipe;
+  const pts = streamPoints(app, pour, timeS);
+  const visual = liquidVisual(pour.liquid);
+
+  // Premultiplied-alpha blend so the stream brightens the scene where it
+  // crosses high-luminance fragments without blowing out.
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+  gl.useProgram(stream.program);
+  gl.uniform1f(stream.uniforms.loc('u_time'), timeS);
+  gl.uniform1f(stream.uniforms.loc('u_aspect'), pipe.ctx.width / pipe.ctx.height);
+  gl.uniform2f(stream.uniforms.loc('u_p0'), pts.p0x, pts.p0y);
+  gl.uniform2f(stream.uniforms.loc('u_p1'), pts.p1x, pts.p1y);
+  gl.uniform2f(stream.uniforms.loc('u_p2'), pts.p2x, pts.p2y);
+  gl.uniform3f(
+    stream.uniforms.loc('u_streamColor'),
+    visual.color[0],
+    visual.color[1],
+    visual.color[2],
+  );
+  gl.uniform1f(stream.uniforms.loc('u_streamOpacity'), opacity);
+  // Slightly thicker at source, thinner at impact.
+  gl.uniform1f(stream.uniforms.loc('u_streamWidth0'), 0.014);
+  gl.uniform1f(stream.uniforms.loc('u_streamWidth1'), 0.009);
+
+  gl.bindVertexArray(stream.vao);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindVertexArray(null);
+
+  gl.disable(gl.BLEND);
+}
+
+// ---------------------------------------------------------------------------
 // Pointer input
 // ---------------------------------------------------------------------------
 
@@ -432,6 +547,7 @@ function render(pipe: Pipeline, app: AppState, timeS: number): void {
   drawBackdrop(pipe, timeS);
   drawShadows(pipe, packed);
   drawScene(pipe, packed, app.game.capacity);
+  drawStream(pipe, app, timeS);
 }
 
 function start(): void {
