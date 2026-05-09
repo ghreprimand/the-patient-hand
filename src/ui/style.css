@@ -1,0 +1,48 @@
+:root {
+  color-scheme: dark;
+  /* Warm apothecary palette baseline. Anything tube/liquid lives in WebGL.
+     CSS variables here are only for HTML overlay UI (HUD, modals, menus). */
+  --tph-bg: #1a1108;
+  --tph-walnut-deep: #2a1a0e;
+  --tph-walnut-mid: #4a3320;
+  --tph-brass: #c9a25a;
+  --tph-lamp: #ffd49a;
+  --tph-parchment: #ead7b4;
+  --tph-ink: #2a1a0e;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--tph-bg);
+  color: var(--tph-parchment);
+  font-family: 'Cormorant Garamond', 'Garamond', 'Times New Roman', serif;
+  /* Disable double-tap-to-zoom and text selection on mobile during play. */
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  overscroll-behavior: none;
+  /* Lock the page itself from scrolling — WebGL fills the viewport. */
+  overflow: hidden;
+  touch-action: none;
+}
+
+#stage {
+  display: block;
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  /* Hint to the compositor that this is a stable repaint surface. */
+  will-change: transform;
+  /* Crispness override: on HiDPI we'll size the backing store ourselves. */
+  image-rendering: auto;
+}

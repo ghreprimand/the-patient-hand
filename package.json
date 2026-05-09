@@ -13,6 +13,7 @@
     "test": "node --test --import=tsx \"src/**/*.test.ts\""
   },
   "devDependencies": {
+    "@types/node": "^25.6.2",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3",
     "vite": "^5.4.10"
